@@ -39,18 +39,45 @@ async fn main() -> Result<()> {
     );
 
     let state = Arc::new(AppState::new(cfg));
-    let sweeper = tokio::spawn(run_sweeper(state.clone()));
+    let mut sweeper = tokio::spawn(run_sweeper(state.clone()));
 
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .with_context(|| format!("binding {listen}"))?;
-    axum::serve(listener, app(state))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-            info!("shutdown signal received");
-        })
-        .await?;
+    let server = axum::serve(listener, app(state)).with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("shutdown signal received");
+    });
 
-    sweeper.abort();
-    Ok(())
+    // Poll the sweeper's handle, never park it: the task is an infinite
+    // loop, so its JoinHandle resolving — panic, return, anything — means
+    // lease expiry and deadline sweeping are dead while the CP keeps
+    // accepting work (#1474). There is no in-process recovery a restarted
+    // loop would not immediately re-trip, and the task's exit guard has
+    // already turned /health over — so the outcome is fatal: exit non-zero
+    // and let the process supervisor restart a clean CP.
+    tokio::select! {
+        res = server => {
+            res?;
+            sweeper.abort();
+            Ok(())
+        }
+        res = &mut sweeper => {
+            match &res {
+                Ok(()) => tracing::error!(
+                    "sweeper task returned — it is an infinite loop, so this is a bug"
+                ),
+                Err(e) if e.is_panic() => tracing::error!(
+                    error = %e,
+                    "sweeper task panicked — lease expiry and deadline sweeping are dead"
+                ),
+                // Only reachable if the task is cancelled from elsewhere;
+                // the abort below runs after this select resolves.
+                Err(e) => tracing::error!(error = %e, "sweeper task terminated abnormally"),
+            }
+            anyhow::bail!(
+                "sweeper task terminated — exiting so the supervisor restarts a clean CP"
+            )
+        }
+    }
 }

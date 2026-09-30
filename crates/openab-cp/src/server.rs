@@ -59,6 +59,8 @@ pub struct AppState {
     /// Live connections per identity (`namespace/name`), counted from the
     /// upgrade so pre-registration sockets are bounded too.
     conns: Mutex<BTreeMap<String, u32>>,
+    /// Liveness signal for the lease/deadline sweeper, served by `/health`.
+    sweeper_health: Mutex<SweeperHealth>,
 }
 
 impl AppState {
@@ -70,6 +72,7 @@ impl AppState {
             router: Router::new(),
             rpc_id: AtomicU64::new(1),
             conns: Mutex::new(BTreeMap::new()),
+            sweeper_health: Mutex::new(SweeperHealth::NotStarted),
         }
     }
 
@@ -99,6 +102,71 @@ impl AppState {
     pub fn conn_count(&self, logical_id: &str) -> u32 {
         self.conns.lock().get(logical_id).copied().unwrap_or(0)
     }
+
+    /// Stamp the sweeper's heartbeat: called once per completed sweep pass.
+    fn sweeper_beat(&self) {
+        *self.sweeper_health.lock() = SweeperHealth::Alive(Instant::now());
+    }
+
+    /// Mark the sweeper dead: called by the task's exit guard on ANY exit —
+    /// return, panic unwind, or abort — so `/health` turns over during the
+    /// task's own teardown, before its JoinHandle is even observed.
+    fn sweeper_exited(&self) {
+        *self.sweeper_health.lock() = SweeperHealth::Dead;
+    }
+
+    /// `Some(reason)` when `/health` must not report ok. `now` and `stall`
+    /// are parameters so tests can travel time — the same convention as
+    /// `sweep_leases` and `sweep_deadlines`.
+    fn sweeper_down(&self, now: Instant, stall: Duration) -> Option<SweeperDown> {
+        match *self.sweeper_health.lock() {
+            SweeperHealth::NotStarted => Some(SweeperDown::NotStarted),
+            SweeperHealth::Dead => Some(SweeperDown::Dead),
+            SweeperHealth::Alive(t) if now.saturating_duration_since(t) > stall => {
+                Some(SweeperDown::Stalled)
+            }
+            SweeperHealth::Alive(_) => None,
+        }
+    }
+}
+
+/// Liveness signal for the lease/deadline sweeper, surfaced by `/health`.
+///
+/// `run_sweeper` is the only task that expires leases and fires delegation
+/// deadlines; while it is dead the CP keeps accepting work whose
+/// maintenance never happens (#1474). `Alive` carries the last *completed*
+/// pass, so a sweeper stuck inside one — its JoinHandle never resolves, so
+/// supervision cannot see it — still goes unhealthy once it stops beating.
+enum SweeperHealth {
+    /// No sweeper has ever run against this state.
+    NotStarted,
+    /// A sweep pass completed at this instant.
+    Alive(Instant),
+    /// The task terminated — set by its exit guard on drop.
+    Dead,
+}
+
+/// Why `/health` is refusing to report ok; the reason goes in the response
+/// body so a probe or operator can tell a dead task from a stalled or
+/// never-started one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweeperDown {
+    /// `run_sweeper` was never spawned for this state.
+    NotStarted,
+    /// The task terminated (panic, return, or abort while serving).
+    Dead,
+    /// No pass has completed within the stall slack.
+    Stalled,
+}
+
+impl std::fmt::Display for SweeperDown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotStarted => "not started",
+            Self::Dead => "dead",
+            Self::Stalled => "stalled",
+        })
+    }
 }
 
 /// RAII connection slot. Dropping it frees the identity's quota; it is never
@@ -127,8 +195,13 @@ pub fn app(state: Arc<AppState>) -> AxumRouter {
         .with_state(state)
 }
 
-async fn health() -> &'static str {
-    "ok"
+async fn health(State(state): State<Arc<AppState>>) -> axum::response::Response {
+    match state.sweeper_down(Instant::now(), SWEEPER_STALL_SLACK) {
+        None => (StatusCode::OK, "ok").into_response(),
+        Some(down) => {
+            (StatusCode::SERVICE_UNAVAILABLE, format!("sweeper {down}\n")).into_response()
+        }
+    }
 }
 
 /// Reason string on the close frame sent when `cp/register` never arrived.
@@ -985,9 +1058,38 @@ pub fn sweep_leases(state: &Arc<AppState>, lease: Duration) {
     }
 }
 
+/// One sweeper tick: the cadence lease expiry and delegation deadlines are
+/// re-evaluated at.
+const SWEEP_TICK: Duration = Duration::from_secs(1);
+
+/// How long `/health` still reports ok after the sweeper's last completed
+/// pass. Deliberately many ticks: scheduler delay or one slow pass is not a
+/// dead sweeper, but ten seconds of silence from a one-second loop is.
+const SWEEPER_STALL_SLACK: Duration = Duration::from_secs(10);
+
+/// Armed for the sweeper task's whole lifetime: its Drop marks the health
+/// signal dead on EVERY exit — return, panic unwind, and abort all drop the
+/// future — so `/health` cannot keep answering ok after the task is gone,
+/// even in the gap before a supervisor observes the JoinHandle.
+struct SweeperExitGuard(Arc<AppState>);
+
+impl Drop for SweeperExitGuard {
+    fn drop(&mut self) {
+        self.0.sweeper_exited();
+    }
+}
+
 /// Background sweeps: lease expiry and delegation deadlines.
+///
+/// Liveness contract (#1474): the exit guard is armed first — a task that
+/// dies has already marked `/health` down by the time its JoinHandle
+/// resolves — and each completed pass stamps the heartbeat, so a stall is
+/// as visible as a death. The task runs forever; the caller MUST poll the
+/// JoinHandle and treat its resolution as fatal (`main` exits), never
+/// detach it.
 pub async fn run_sweeper(state: Arc<AppState>) {
-    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let _exit_guard = SweeperExitGuard(Arc::clone(&state));
+    let mut tick = tokio::time::interval(SWEEP_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let lease = Duration::from_secs(state.cfg.lease_expiry_secs);
     loop {
@@ -1005,6 +1107,10 @@ pub async fn run_sweeper(state: Arc<AppState>) {
         ) {
             let _ = inst.tx.try_send(frame);
         }
+
+        // Beat only after both sweeps: a pass that wedges mid-sweep stops
+        // the heartbeat and goes stale on `/health` like a dead task does.
+        state.sweeper_beat();
     }
 }
 
@@ -1145,6 +1251,47 @@ mod tests {
         let cfg: CpConfig = toml::from_str(cfg_toml).unwrap();
         cfg.validate().unwrap();
         Arc::new(AppState::new(cfg))
+    }
+
+    #[test]
+    fn sweeper_health_lifecycle() {
+        let state = state_with("");
+        let now = Instant::now();
+        let stall = Duration::from_secs(10);
+        // Never spawned: the endpoint must not claim ok from the start.
+        assert_eq!(
+            state.sweeper_down(now, stall),
+            Some(SweeperDown::NotStarted)
+        );
+        // One completed pass makes it healthy…
+        state.sweeper_beat();
+        assert_eq!(state.sweeper_down(now, stall), None);
+        // …but only within the slack — a pass that wedges stops beating.
+        assert_eq!(
+            state.sweeper_down(now + stall + Duration::from_secs(1), stall),
+            Some(SweeperDown::Stalled)
+        );
+        // Task exit is terminal however fresh the last beat was.
+        state.sweeper_exited();
+        assert_eq!(state.sweeper_down(now, stall), Some(SweeperDown::Dead));
+    }
+
+    #[test]
+    fn sweeper_exit_guard_marks_dead_during_unwind() {
+        // The mechanism behind #1474: a panic inside the sweep loop flips
+        // the liveness signal while the task is still unwinding — before
+        // the JoinHandle is even observed.
+        let state = state_with("");
+        state.sweeper_beat();
+        let st = Arc::clone(&state);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = SweeperExitGuard(st);
+            panic!("simulated sweeper panic");
+        }));
+        assert_eq!(
+            state.sweeper_down(Instant::now(), Duration::from_secs(60)),
+            Some(SweeperDown::Dead)
+        );
     }
 
     #[test]

@@ -49,8 +49,17 @@ rationale. The essentials:
 
 ## Health
 
-`GET /health` answers `ok` (liveness only; deeper checks are tracked in
-issue #1474).
+`GET /health` reports the control plane's liveness, including the background
+sweeper that expires leases and fires delegation deadlines:
+
+- `200 ok` while the sweeper is alive — it has completed a sweep pass within
+  the last 10 seconds.
+- `503` with the reason in the body (`sweeper not started`, `sweeper dead`,
+  `sweeper stalled`) when no sweeper has run, when the task has exited, or
+  when it has gone quiet. A dead sweeper is fatal to the process: `main`
+  treats its JoinHandle resolving as a hard failure and exits non-zero, so
+  the process supervisor restarts a clean CP rather than serving with
+  leases that never expire (issue #1474).
 
 ## Client behavior to expect
 
