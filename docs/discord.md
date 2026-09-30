@@ -425,6 +425,10 @@ Discord only allows one thread per message. If another bot already created a thr
 
 The bot token is wrong or expired. Reset it in the Developer Portal and redeploy.
 
+### SIGSEGV right after connect (macOS x86_64)
+
+Some 0.10.0-beta.4 binaries crashed seconds after `registered global slash commands`, during post-connect command sync (`discord::Handler::handle_config_command` / gateway decompression — #1535, #1531). serenity inflates every gateway payload through `flate2`; the build now pins flate2 to the system `zlib` backend instead of the pure-Rust `miniz_oxide` + `simd-adler32` stack implicated in the crashes. Upgrading past this change should resolve it; report back on #1535 if a crash persists with a `.ips` crash log attached.
+
 ### "Failed to start agent"
 
 The agent CLI isn't authenticated. For kiro-cli:

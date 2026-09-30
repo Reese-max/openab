@@ -42,7 +42,14 @@ aws-sdk-secretsmanager = { version = "1", optional = true }
 aws-sdk-s3 = { version = "1", optional = true }
 aws-config = { version = "1", optional = true }
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
-flate2 = { version = "1", optional = true }
+# The `zlib` feature forces flate2's C/system-zlib backend, which outranks the
+# default `rust_backend` (miniz_oxide + simd-adler32) in flate2's backend
+# selection. serenity inflates every gateway payload through flate2, and that
+# pure-Rust decompressor is implicated in post-connect SIGSEGVs on x86_64 macOS
+# release builds (#1531, #1535) — the `discord` feature enables this dep so the
+# OS zlib handles gateway decompression instead. pre-seed shares the same dep
+# and gets the same backend for archive extraction.
+flate2 = { version = "1", features = ["zlib"], optional = true }
 tar = { version = "0.4.45", default-features = false, optional = true }
 aws-sigv4 = { version = "1", optional = true }
 aws-credential-types = { version = "1", optional = true }
@@ -63,7 +70,7 @@ tokio = { version = "1", features = ["test-util"] }
 
 [features]
 default = ["discord", "slack", "secrets-aws", "agentcore", "config-s3"]
-discord = ["dep:serenity"]
+discord = ["dep:serenity", "dep:flate2"]
 slack = []
 secrets-aws = ["dep:aws-sdk-secretsmanager", "dep:aws-config"]
 config-s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
