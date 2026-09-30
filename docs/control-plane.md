@@ -56,7 +56,10 @@ issue #1474).
 
 - CP-initiated closes use WS code 1008 with a reason: `registration
   timeout`, `lease expired`, or `outbound queue overflow`. On any of these,
-  reconnect, re-authenticate, and re-register.
+  reconnect, re-authenticate, and re-register. Process shutdown (SIGTERM,
+  SIGHUP, SIGINT — e.g. `docker stop`, ECS, k8s) uses code **1012**
+  (service restart) with reason `control plane shutting down` instead: same
+  recovery, different signal — your client did nothing wrong.
 - A peer that stops reading is disconnected: any single outbound write that
   blocks longer than `write_timeout_secs` is treated as a dead peer, so keep
   draining the socket even while busy. The same rule applies to the queue
@@ -121,7 +124,14 @@ issue #1474).
   the CP (`default_max_delegated_sessions_cap`, or a per-identity override).
   The ack's `effective_max_delegated_sessions` is the value that counts.
 - After a lease expires or the CP restarts, in-flight delegations are gone:
-  initiators reconcile against their own deadlines and re-delegate.
+  initiators reconcile against their own deadlines and re-delegate. On a
+  *graceful* stop the CP resolves them first: within `shutdown_drain_secs`
+  (plus at most one `write_timeout_secs` for a stalled close write) every
+  initiator gets a synthesized `target_disconnected` terminal (error
+  `control plane shutting down`) and every serving runtime a `cp/cancel`,
+  ahead of the 1012 close; a `cp/delegate` that reaches the CP mid-drain is
+  refused `SATURATED` — back off and retry after reconnecting. A SIGKILL
+  still leaves reconciliation to your deadlines.
 
 ## Observer surface (lobby)
 

@@ -546,10 +546,17 @@ recovery semantics:
   instance's live id return the same `POLICY_DENIED` error object, byte for
   byte, so cancel cannot be used as an existence oracle for other tenants'
   delegation ids. The CP's own logs keep the distinction.
-- **CP restart semantics.** A CP restart is equivalent to every lease
-  expiring at once *with* the connection closure that implies — except that
-  the CP is not there to send it: the in-flight table and the sockets die
-  together with the process, so no synthesized `timeout` or
+- **CP restart semantics.** A *graceful* CP stop (SIGTERM/SIGHUP/SIGINT)
+  drains first: every in-flight delegation is resolved — initiators get a
+  synthesized `target_disconnected` terminal and serving runtimes a
+  `cp/cancel`, both stamped `control plane shutting down`, and admissions
+  racing the drain are refused `SATURATED` — then every connection closes
+  with code 1012, all inside `shutdown_drain_secs` plus at most one
+  `write_timeout_secs` for a stalled close write. A
+  *hard* restart (SIGKILL, crash, drain budget exhausted) is equivalent to
+  every lease expiring at once *with* the connection closure that implies —
+  except that the CP is not there to send it: the in-flight table and the
+  sockets die together with the process, so no synthesized `timeout` or
   `target_disconnected` frame can be emitted for delegations that were in
   flight. Runtimes observe the transport drop, reconnect with backoff, and
   re-register (new handles, empty in-flight table). Initiators reconcile

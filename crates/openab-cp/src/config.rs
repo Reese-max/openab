@@ -90,6 +90,21 @@ pub struct CpConfig {
     /// short enough that a dead one frees its quota promptly.
     #[serde(default = "default_write_timeout_secs")]
     pub write_timeout_secs: u64,
+
+    /// How long the CP waits for live connections to drain after a shutdown
+    /// signal (SIGTERM/SIGHUP/SIGINT) before the process exits.
+    ///
+    /// On shutdown every in-flight delegation is resolved first — the
+    /// initiator gets a synthesized `target_disconnected` terminal and the
+    /// serving runtime a `cp/cancel` — then each connection flushes its
+    /// queued outbound frames and sends its close frame, all inside this
+    /// budget. A stalled peer's close write is additionally bounded by
+    /// `write_timeout_secs`, so it can never hold the CP past this budget
+    /// plus one write timeout. 0 disables the wait: connections are
+    /// signalled and the process exits as soon as the listener is closed
+    /// (sockets still get their close frames if they flush in time).
+    #[serde(default = "default_shutdown_drain_secs")]
+    pub shutdown_drain_secs: u64,
     /// Maximum size of prompt/result excerpts mirrored to observers in
     /// `cp/event` frames. The lobby is an audit surface, not a second
     /// delivery path: excerpts are truncated with a marker, never rejected.
@@ -183,6 +198,9 @@ fn default_max_connections_per_identity() -> u32 {
 }
 fn default_write_timeout_secs() -> u64 {
     30
+}
+fn default_shutdown_drain_secs() -> u64 {
+    5
 }
 fn default_max_outbound_queue_bytes() -> usize {
     16 * 1024 * 1024
