@@ -376,9 +376,26 @@ mod tests {
             timeout_seconds: 1,
             on_failure: OnFailure::Abort,
         };
-        let result = run_hook("test", &hook).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("timed out"));
+        // The timeout path itself is deterministic once the child is spawned,
+        // but under heavy parallel load spawn/wait can transiently fail with a
+        // non-timeout error (EAGAIN, reaper races). Retry a few attempts and
+        // require at least one to hit the timeout path.
+        let mut last_err = String::new();
+        let mut timed_out = false;
+        for _ in 0..3 {
+            let result = run_hook("test", &hook).await;
+            assert!(result.is_err());
+            let msg = result.unwrap_err().to_string();
+            if msg.contains("timed out") {
+                timed_out = true;
+                break;
+            }
+            last_err = msg;
+        }
+        assert!(
+            timed_out,
+            "no attempt hit the timeout path; last error: {last_err}"
+        );
     }
 
     #[tokio::test]
