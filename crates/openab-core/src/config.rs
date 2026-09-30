@@ -534,6 +534,16 @@ pub struct DiscordConfig {
     /// Empty (default) = role mentions do not trigger the bot.
     #[serde(default)]
     pub allowed_role_ids: Vec<String>,
+    /// Treat `@everyone` / `@here` mass pings as a mention of this bot.
+    /// Discord mass pings set `mention_everyone` instead of populating
+    /// `mentions[]`, so `allow_user_messages = "mentions"` would otherwise
+    /// silently drop them. When true, a mass ping counts as a mention
+    /// anywhere a direct @mention does (user gating, trusted-bot admission,
+    /// ambient discard). Default: false — mass pings are ignored (previous
+    /// behavior). Useful in multi-bot deployments where one @everyone should
+    /// wake all bots.
+    #[serde(default)]
+    pub everyone_mentions_bot: bool,
     /// Allow the bot to respond to Discord direct messages (DMs).
     /// Default: false (opt-in). `allowed_users` still applies in DMs.
     #[serde(default)]

@@ -1645,6 +1645,7 @@ async fn main() -> anyhow::Result<()> {
             role_triggers = allowed_role_ids.len(),
             allow_bot_messages = ?discord_cfg.allow_bot_messages,
             allow_user_messages = ?discord_cfg.allow_user_messages,
+            everyone_mentions_bot = discord_cfg.everyone_mentions_bot,
             allow_dm = discord_cfg.allow_dm,
             "starting discord adapter"
         );
@@ -1700,6 +1701,7 @@ async fn main() -> anyhow::Result<()> {
             trusted_bot_ids,
             allow_user_messages: discord_cfg.allow_user_messages,
             allowed_role_ids,
+            everyone_mentions_bot: discord_cfg.everyone_mentions_bot,
             participated_threads: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             multibot_threads: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             multibot_cache,

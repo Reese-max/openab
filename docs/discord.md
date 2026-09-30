@@ -71,6 +71,7 @@ allowed_users = ["987654321"]         # user ID allowlist (empty = all)
 allow_bot_messages = "off"            # off | mentions | all
 allow_user_messages = "multibot-mentions"      # multibot-mentions | involved | mentions
 trusted_bot_ids = []                  # bot user IDs allowed through (empty = any)
+everyone_mentions_bot = false         # true = @everyone/@here count as a bot mention
 ```
 
 ### `allowed_channels` / `allowed_users`
@@ -166,6 +167,18 @@ When `allow_user_messages = "multibot-mentions"` is set alongside `allowed_role_
 
 This gives the best of both worlds: one role mention to summon all bots, but subsequent messages in the thread don't cause all bots to pile on.
 
+### `everyone_mentions_bot`
+
+When `true`, a `@everyone` or `@here` mass ping counts as a mention of this bot — anywhere a direct @mention is checked (user gating, trusted-bot admission, ambient-mode discard).
+
+```toml
+everyone_mentions_bot = true   # @everyone / @here wake this bot
+```
+
+Default is `false` — mass pings are ignored. This matters most with `allow_user_messages = "mentions"` or in multi-bot threads under `"multibot-mentions"`: Discord sets `mention_everyone` on mass pings instead of adding the bot to `mentions[]`, so an @everyone summon would otherwise be silently dropped. Enable it when "summon all agents" should wake every bot in a multi-bot deployment.
+
+> **Note:** With the flag on, a *bot* message containing @everyone also counts as a mention for `allow_bot_messages = "mentions"` and the `trusted_bot_ids` admission override — consistent with treating the mass ping as a real mention.
+
 ---
 
 ## @Mention Behavior
@@ -174,7 +187,8 @@ The bot responds to:
 
 1. **Direct @mention** (`@BotUser`) — always works
 2. **Role mention** (`@RoleName`) — only if the role ID is in `allowed_role_ids`
-3. **Thread reply** — depends on `allow_user_messages` mode (no @mention needed in `involved` mode)
+3. **Mass ping** (`@everyone` / `@here`) — only if `everyone_mentions_bot = true`
+4. **Thread reply** — depends on `allow_user_messages` mode (no @mention needed in `involved` mode)
 
 ```
 ✅ @AgentBroker hello           ← user mention, bot responds

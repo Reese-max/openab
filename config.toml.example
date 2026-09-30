@@ -13,6 +13,8 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 # trusted_bot_ids = []         # empty = any bot (mode permitting); set to restrict
 # allowed_role_ids = []        # role IDs that trigger the bot (same as direct @mention)
                                # note: if multiple bots share the same role, all will respond simultaneously
+# everyone_mentions_bot = false  # true = @everyone/@here mass pings count as a bot mention
+                               # false (default) = mass pings ignored (previous behavior)
 # allow_user_messages = "multibot-mentions"  # "multibot-mentions" (default) | "involved" | "mentions"
                                      # "involved" = reply in threads bot owns or has participated in
                                      # "mentions" = always require @mention

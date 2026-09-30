@@ -248,6 +248,9 @@ pub struct Handler {
     pub allow_user_messages: AllowUsers,
     /// Role IDs that trigger the bot (same as direct @mention).
     pub allowed_role_ids: HashSet<u64>,
+    /// Treat `@everyone` / `@here` mass pings (`msg.mention_everyone`) as a
+    /// mention of this bot. Default false — mass pings are ignored. (#1538)
+    pub everyone_mentions_bot: bool,
     /// Positive-only cache: thread channel_id → cached_at for threads where bot has participated.
     pub participated_threads: tokio::sync::Mutex<HashMap<String, tokio::time::Instant>>,
     /// Positive-only cache: thread channel_id → cached_at for threads where other bots have posted.
@@ -485,13 +488,16 @@ impl EventHandler for Handler {
         let in_allowed_channel =
             self.allow_all_channels || self.allowed_channels.contains(&channel_id);
 
-        let is_mentioned = msg.mentions_user_id(bot_id)
-            || msg.content.contains(&format!("<@{}>", bot_id))
-            || (!self.allowed_role_ids.is_empty()
-                && msg
-                    .mention_roles
-                    .iter()
-                    .any(|r| self.allowed_role_ids.contains(&r.get())));
+        let mention_roles: Vec<u64> = msg.mention_roles.iter().map(|r| r.get()).collect();
+        let is_mentioned = is_bot_mentioned(
+            msg.mentions_user_id(bot_id),
+            &msg.content,
+            bot_id.get(),
+            msg.mention_everyone,
+            self.everyone_mentions_bot,
+            &mention_roles,
+            &self.allowed_role_ids,
+        );
 
         // Early-gating optimization for bot messages to avoid unnecessary
         // async/HTTP thread detection calls when ambient mode is inactive and
@@ -3202,6 +3208,33 @@ fn detect_thread(
         || parent_id.is_some_and(|pid| allowed_channels.contains(&pid));
     let bot_owns = owner_id.is_some_and(|oid| oid == bot_id);
     (in_allowed_thread, Some(bot_owns))
+}
+
+/// Pure mention detection: does this message count as an @mention of the bot?
+///
+/// Extracted from `EventHandler::message` for testability — serenity `Message`
+/// values cannot be constructed in unit tests. A message counts when any of:
+/// - `mentions_bot_user`: Discord's parsed `mentions[]` includes the bot
+///   (`msg.mentions_user_id(bot_id)`)
+/// - `content` contains the raw `<@bot_id>` form (fallback for payloads where
+///   `mentions[]` is not populated)
+/// - `mention_everyone` is set AND `everyone_mentions_bot` is enabled —
+///   `@everyone` / `@here` mass pings count as a mention (#1538)
+/// - `mention_roles` intersects `allowed_role_ids` (role mention = trigger)
+pub fn is_bot_mentioned(
+    mentions_bot_user: bool,
+    content: &str,
+    bot_id: u64,
+    mention_everyone: bool,
+    everyone_mentions_bot: bool,
+    mention_roles: &[u64],
+    allowed_role_ids: &HashSet<u64>,
+) -> bool {
+    mentions_bot_user
+        || content.contains(&format!("<@{}>", bot_id))
+        || (everyone_mentions_bot && mention_everyone)
+        || (!allowed_role_ids.is_empty()
+            && mention_roles.iter().any(|r| allowed_role_ids.contains(r)))
 }
 
 /// Returns `true` if the author should be denied by the user allowlist.
