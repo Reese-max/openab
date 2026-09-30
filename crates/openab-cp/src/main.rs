@@ -60,6 +60,16 @@ async fn shutdown_signal() -> &'static str {
     }
 }
 
+/// Conventional exit status for a signal-driven exit: 128 + signal number.
+fn signal_exit_code(signal: &str) -> i32 {
+    match signal {
+        "SIGHUP" => 129,
+        "SIGINT" => 130,
+        "SIGTERM" => 143,
+        _ => 1,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -94,6 +104,17 @@ async fn main() -> Result<()> {
         })
         .await?;
 
+    // A second signal while the drain is still running is the operator's
+    // "stop waiting": exit immediately with the signal's conventional
+    // status. `shutdown_signal` registers fresh streams each call, so the
+    // repeat SIGINT/SIGTERM/SIGHUP still resolves it — the drain itself is
+    // bounded, so this only shortens a wait, never causes one.
+    let force_quit = tokio::spawn(async {
+        let signal = shutdown_signal().await;
+        tracing::warn!(signal, "second shutdown signal — forcing immediate exit");
+        std::process::exit(signal_exit_code(signal));
+    });
+
     // The listener has stopped accepting and in-flight HTTP work is done;
     // the WS connection tasks are detached spawns still running. Give them a
     // real shutdown — synthesized terminals, close frames, bounded drain —
@@ -101,8 +122,24 @@ async fn main() -> Result<()> {
     // stops last: a lease/deadline expiry during the drain still
     // synthesizes normally.
     graceful_shutdown(&state).await;
+    force_quit.abort();
     sweeper.abort();
     let _ = sweeper.await;
     info!("openab-cp stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::signal_exit_code;
+
+    #[test]
+    fn signal_exit_codes_follow_the_128_plus_signum_convention() {
+        // The force-quit path must report WHICH signal ended the process so
+        // an operator (or a supervisor's exit-code log) can tell a forced
+        // exit from a clean drain — and from a crash.
+        assert_eq!(signal_exit_code("SIGHUP"), 129);
+        assert_eq!(signal_exit_code("SIGINT"), 130);
+        assert_eq!(signal_exit_code("SIGTERM"), 143);
+    }
 }

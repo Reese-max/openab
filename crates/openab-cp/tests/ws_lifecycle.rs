@@ -904,6 +904,36 @@ async fn spawn_cp_process() -> (tokio::process::Child, String, std::path::PathBu
     (child, format!("ws://127.0.0.1:{port}/cp"), cfg_path)
 }
 
+#[tokio::test]
+async fn a_second_signal_latching_mid_close_still_sends_a_close_frame() {
+    // The close a connection is promised must not be eaten by a second
+    // signal latching while its frame is still on the wire: a lease sweep
+    // firing during the shutdown drain (or the process signal landing
+    // during a per-connection close) previously aborted the close write —
+    // the peer saw a bare TCP reset instead of the Close frame. Whichever
+    // shutdown path wins, some Close frame must always be observed.
+    let (state, url) = spawn_cp(cfg("register_timeout_secs = 30")).await;
+    let mut ws = connect(&url).await.expect("connection accepted");
+    assert_eq!(
+        register(&mut ws, "i-1").await["result"]["protocol_version"],
+        1
+    );
+    let handle = state.registry.list("prod")[0].handle;
+
+    // Latch the per-connection signal the way the sweeper does, then the
+    // process-wide one immediately behind it — the second latch can land
+    // while the first close frame is still being written.
+    assert!(state.registry.signal_shutdown(handle, "lease expired"));
+    graceful_shutdown(&state).await;
+
+    let closed = wait_closed(&mut ws, Duration::from_secs(5)).await;
+    assert!(
+        matches!(closed, Some(Closed::Frame { .. })),
+        "a second signal mid-close must not reduce the peer's close frame \
+         to a bare reset — got {closed:?}"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn sigterm_and_sighup_run_the_drain_and_exit_cleanly() {

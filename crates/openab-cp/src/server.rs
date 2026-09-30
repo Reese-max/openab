@@ -282,6 +282,23 @@ async fn send_bounded(
     }
 }
 
+/// Send the LAST frame a connection will ever get — a close frame, or a
+/// terminal error response written just before teardown. Unlike
+/// [`send_bounded`] this is raced only against `write_timeout`, never the
+/// close watch: the connection is already committed to ending, and a second
+/// signal latching mid-write (e.g. a lease sweep landing during the
+/// shutdown drain, or the process signal during a per-connection close)
+/// must not eat the frame the peer was promised. A peer that has stopped
+/// reading is still bounded by `write_timeout`, so it cannot hold teardown
+/// longer than that.
+async fn send_final_frame(
+    sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    msg: Message,
+    write_timeout: Duration,
+) {
+    let _ = tokio::time::timeout(write_timeout, sink.send(msg)).await;
+}
+
 async fn ws_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -359,7 +376,7 @@ async fn handle_connection(
     // only reports transitions that postdate the subscription, so the
     // already-latched reason is checked once explicitly.
     if let Some(reason) = close.process_reason() {
-        let _ = send_bounded(&mut sink, restart_close(reason), write_timeout, &mut close).await;
+        send_final_frame(&mut sink, restart_close(reason), write_timeout).await;
         return;
     }
 
@@ -389,7 +406,7 @@ async fn handle_connection(
                 Some(reason) => restart_close(reason),
                 None => policy_close(close.reason().unwrap_or(REASON_SHUTDOWN)),
             };
-            let _ = send_bounded(&mut sink, frame, write_timeout, &mut close).await;
+            send_final_frame(&mut sink, frame, write_timeout).await;
             return;
         }
     } {
@@ -404,11 +421,10 @@ async fn handle_connection(
                 timeout_secs = state.cfg.register_timeout_secs,
                 "no cp/register within the registration deadline — closing"
             );
-            let _ = send_bounded(
+            send_final_frame(
                 &mut sink,
                 policy_close(REASON_REGISTER_TIMEOUT),
                 write_timeout,
-                &mut close,
             )
             .await;
             return;
@@ -418,11 +434,10 @@ async fn handle_connection(
         Ok(ok) => ok,
         Err((id, err)) => {
             let resp = JsonRpcErrorResponse::new(id, err);
-            let _ = send_bounded(
+            send_final_frame(
                 &mut sink,
                 Message::Text(serde_json::to_string(&resp).expect("serializable").into()),
                 write_timeout,
-                &mut close,
             )
             .await;
             return;
@@ -482,11 +497,10 @@ async fn handle_connection(
                     ),
                 ),
             );
-            let _ = send_bounded(
+            send_final_frame(
                 &mut sink,
                 Message::Text(serde_json::to_string(&resp).expect("serializable").into()),
                 write_timeout,
-                &mut close,
             )
             .await;
             return;
@@ -542,7 +556,7 @@ async fn handle_connection(
                 None => close.reason().map(policy_close),
             };
             if let Some(frame) = frame {
-                let _ = send_bounded(&mut sink, frame, write_timeout, &mut close).await;
+                send_final_frame(&mut sink, frame, write_timeout).await;
             }
         }
         // `_registered` runs teardown on the way out.
@@ -653,8 +667,10 @@ async fn handle_connection(
         );
         // Bounded like every other write: a peer that has stopped reading
         // must not be able to hold teardown (and its quota slot) by refusing
-        // to accept the close frame.
-        let _ = send_bounded(&mut sink, restart_close(reason), write_timeout, &mut close).await;
+        // to accept the close frame. The write is NOT raced against the
+        // close watch: a second signal latching mid-write (a lease sweep
+        // landing mid-drain) must not eat the promised close frame.
+        send_final_frame(&mut sink, restart_close(reason), write_timeout).await;
     } else if let Some(reason) = cp_close_reason {
         info!(
             agent = %format!("{}/{}", identity.namespace, identity.name),
@@ -664,8 +680,10 @@ async fn handle_connection(
         );
         // Bounded like every other write: a peer that has stopped reading must
         // not be able to delay teardown (and its quota slot) by refusing to
-        // accept the close frame.
-        let _ = send_bounded(&mut sink, policy_close(reason), write_timeout, &mut close).await;
+        // accept the close frame. Not raced against the close watch either:
+        // the process signal may latch mid-write while this frame is still
+        // the only explanation the peer will get.
+        send_final_frame(&mut sink, policy_close(reason), write_timeout).await;
     }
 
     // Teardown runs here, when `_registered` drops — on this path and on an

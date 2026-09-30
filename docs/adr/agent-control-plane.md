@@ -552,7 +552,9 @@ recovery semantics:
   `cp/cancel`, both stamped `control plane shutting down`, and admissions
   racing the drain are refused `SATURATED` — then every connection closes
   with code 1012, all inside `shutdown_drain_secs` plus at most one
-  `write_timeout_secs` for a stalled close write. A
+  `write_timeout_secs` for a stalled close write. A second shutdown signal
+  during the drain is the operator's "stop waiting": the process exits
+  immediately with the signal's conventional status (128 + signum). A
   *hard* restart (SIGKILL, crash, drain budget exhausted) is equivalent to
   every lease expiring at once *with* the connection closure that implies —
   except that the CP is not there to send it: the in-flight table and the
