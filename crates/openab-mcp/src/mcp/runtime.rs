@@ -3309,6 +3309,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn start_paste_login_builtin_without_env_var_errors_loud() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
