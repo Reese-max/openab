@@ -868,23 +868,25 @@ async fn shutdown_closes_sockets_that_never_registered() {
     );
 }
 
-/// Spawn a real `openab-cp` process bound to an ephemeral port; returns the
-/// child, its WS URL, and the config path (for cleanup). This is the only
-/// proof the OS-level path works: `docker stop`, ECS, and k8s all deliver
-/// SIGTERM before SIGKILL, and the binary used to die by default disposition
-/// without ever running a shutdown path.
-#[cfg(unix)]
 /// The temp config a spawned CP reads, removed when the guard drops — including
 /// on a panicking assert, which otherwise leaves one file per failed run in
 /// `/tmp`.
+#[cfg(unix)]
 struct CfgGuard(std::path::PathBuf);
 
+#[cfg(unix)]
 impl Drop for CfgGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
 }
 
+/// Spawn a real `openab-cp` process bound to an ephemeral port; returns the
+/// child, its WS URL, and a guard that cleans up its config. This is the only
+/// proof the OS-level path works: `docker stop`, ECS, and k8s all deliver
+/// SIGTERM before SIGKILL, and the binary used to die by default disposition
+/// without ever running a shutdown path.
+#[cfg(unix)]
 async fn spawn_cp_process() -> (tokio::process::Child, String, CfgGuard) {
     // Grab an ephemeral port, release it, hand it to the child — the usual
     // tiny race, absorbed by `connect_retry`.

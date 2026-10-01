@@ -44,7 +44,7 @@ type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 static SEQ: AtomicU32 = AtomicU32::new(0);
 
 /// A loopback port that was free a moment ago. The CP is started immediately
-/// after, and [`connect_retry`] absorbs the race either way.
+/// after, and [`Cp::connect`] absorbs the race either way.
 fn free_port() -> u16 {
     let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("a free loopback port");
     let port = probe.local_addr().expect("bound address").port();
@@ -96,6 +96,26 @@ impl Drop for Cp {
     }
 }
 
+impl Cp {
+    /// Connect as `key`, retrying while the CP is still binding its port.
+    ///
+    /// The retry exists because the port is grabbed and released before the
+    /// child binds it. When the retries run out the child's fate is part of the
+    /// panic: from the client side "the CP exited during startup" and "the CP
+    /// is slow" look identical, and the exit status is the only thing that
+    /// tells them apart.
+    async fn connect(&mut self, key: &str) -> Ws {
+        for _ in 0..100 {
+            if let Ok(ws) = connect_as(&self.url, key).await {
+                return ws;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let status = self.child.try_wait().expect("querying the child");
+        panic!("the CP never accepted a connection (child status: {status:?})");
+    }
+}
+
 /// Start the real `openab-cp` binary on a free loopback port.
 async fn spawn_cp() -> Cp {
     spawn_cp_with("shutdown_drain_secs = 5").await
@@ -130,17 +150,6 @@ async fn connect_as(url: &str, key: &str) -> Result<Ws, tokio_tungstenite::tungs
     tokio_tungstenite::connect_async(req)
         .await
         .map(|(ws, _)| ws)
-}
-
-/// Connect as `key`, retrying while the CP is still binding its port.
-async fn connect_retry(url: &str, key: &str) -> Ws {
-    for _ in 0..100 {
-        if let Ok(ws) = connect_as(url, key).await {
-            return ws;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("the CP never accepted a connection");
 }
 
 fn register_frame(name: &str, instance_id: &str) -> String {
@@ -240,7 +249,7 @@ async fn the_drain_budget_bounds_the_shutdown_not_the_process_lifetime() {
     let mut cp = spawn_cp_with("shutdown_drain_secs = 1").await;
 
     tokio::time::sleep(Duration::from_secs(3)).await;
-    let mut ws = connect_retry(&cp.url, KEY).await;
+    let mut ws = cp.connect(KEY).await;
     let ack = register(&mut ws, "koudu", "i-1").await;
     assert_eq!(
         ack["result"]["protocol_version"], 1,
@@ -281,7 +290,7 @@ async fn a_stalled_http_request_cannot_pin_the_shutdown() {
     // and the process would sit until the orchestrator's SIGKILL — the reset
     // this whole path exists to prevent.
     let mut cp = spawn_cp().await;
-    let mut initiator = connect_retry(&cp.url, KEY).await;
+    let mut initiator = cp.connect(KEY).await;
     register(&mut initiator, "koudu", "i-1").await;
     let _stalled = stall_an_http_request(&cp.url).await;
 
@@ -308,7 +317,7 @@ async fn a_second_signal_exits_immediately_while_the_drain_is_pending() {
     // first signal and the exit — including a listener that will not finish its
     // own wait. Armed only after the drain, it would never fire there.
     let mut cp = spawn_cp().await;
-    let mut initiator = connect_retry(&cp.url, KEY).await;
+    let mut initiator = cp.connect(KEY).await;
     register(&mut initiator, "koudu", "i-1").await;
     let _stalled = stall_an_http_request(&cp.url).await;
 
@@ -340,12 +349,12 @@ async fn sigterm_resolves_in_flight_delegations_before_the_process_exits() {
     // orchestrator's grace period, before it escalates to SIGKILL.
     let mut cp = spawn_cp().await;
 
-    let mut initiator = connect_retry(&cp.url, KEY).await;
+    let mut initiator = cp.connect(KEY).await;
     assert_eq!(
         register(&mut initiator, "koudu", "i-1").await["result"]["protocol_version"],
         1
     );
-    let mut worker = connect_retry(&cp.url, KEY_WORKER).await;
+    let mut worker = cp.connect(KEY_WORKER).await;
     assert_eq!(
         register(&mut worker, "worker-1", "i-w").await["result"]["protocol_version"],
         1
@@ -440,10 +449,14 @@ async fn a_connection_opened_during_the_drain_never_registers() {
     // runs: a runtime that reconnects into a closing CP must be turned away
     // (or closed politely), never handed a socket that dies mid-registration.
     let mut cp = spawn_cp().await;
-    let mut existing = connect_retry(&cp.url, KEY).await;
+    let mut existing = cp.connect(KEY).await;
     register(&mut existing, "koudu", "i-1").await;
 
     send_sigterm(cp.child.id().expect("the CP is still running"));
+    // Let the shutdown actually latch: a `cp/register` that completes BEFORE
+    // it is legitimately acked, so racing the latch itself would assert
+    // something untrue. What matters is that nothing registers after it.
+    tokio::time::sleep(Duration::from_millis(250)).await;
 
     // Race the drain with fresh upgrades. Every outcome is acceptable except
     // a successful registration: a refused connection, or a socket closed with

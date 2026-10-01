@@ -559,12 +559,12 @@ recovery semantics:
   crash to most supervisors, and the frames that did not make it are lost
   either way. A second shutdown signal before the process is gone is the
   operator's "stop waiting" and exits immediately with the signal's
-  conventional status (128 + signum — 143 for SIGTERM). Nothing waits on the
-  HTTP listener's own graceful shutdown: the drain is spawned at the signal,
-  because a peer that opened a socket and then stopped sending would
-  otherwise pin that wait indefinitely and take the drain down with it. That
-  wait is bounded by one second of slack *after* the drain ends (and is
-  dropped if it overruns), so no client can delay the exit. A
+  conventional status (128 + signum — 143 for SIGTERM). The listener runs as
+  its own task so nothing waits on the HTTP listener's own graceful shutdown:
+  a peer that opened a socket and then stopped sending would otherwise pin
+  that wait indefinitely and take the drain down with it. After the drain
+  ends, that wait gets one second of slack and is dropped if it overruns, so
+  no client can delay the exit. A
   *hard* restart (SIGKILL, crash, drain budget exhausted) is equivalent to
   every lease expiring at once *with* the connection closure that implies —
   except that the CP is not there to send it: the in-flight table and the

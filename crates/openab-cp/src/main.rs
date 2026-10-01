@@ -43,6 +43,8 @@ const LISTENER_SHUTDOWN_SLACK: Duration = Duration::from_secs(1);
 /// makes "signal it twice" reliable.
 struct ShutdownSignals {
     #[cfg(unix)]
+    interrupt: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
     terminate: Option<tokio::signal::unix::Signal>,
     #[cfg(unix)]
     hangup: Option<tokio::signal::unix::Signal>,
@@ -55,21 +57,28 @@ impl ShutdownSignals {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
-            // A stream that cannot be registered is simply absent: ctrl-c and
-            // whatever else did register still work, and the failure is logged
-            // rather than fatal — a CP that cannot be stopped politely should
-            // still run.
+            // SIGINT goes through the same `Signal` machinery as SIGTERM and
+            // SIGHUP rather than through `tokio::signal::ctrl_c()`, which
+            // re-registers its handler on every call: a repeat arriving between
+            // one wait returning and the next being created would be dropped by
+            // the registry — the gap the double-signal escape hatch cannot
+            // have. A stream that cannot be registered is simply absent: the
+            // others still work, and the failure is logged rather than fatal,
+            // because a CP that cannot be stopped politely should still run.
+            let interrupt = signal(SignalKind::interrupt())
+                .inspect_err(|e| warn!(error = %e, "failed to install SIGINT handler"))
+                .ok();
             let terminate = signal(SignalKind::terminate())
-                .inspect_err(|e| {
-                    warn!(error = %e, "failed to install SIGTERM handler");
-                })
+                .inspect_err(|e| warn!(error = %e, "failed to install SIGTERM handler"))
                 .ok();
             let hangup = signal(SignalKind::hangup())
-                .inspect_err(|e| {
-                    warn!(error = %e, "failed to install SIGHUP handler");
-                })
+                .inspect_err(|e| warn!(error = %e, "failed to install SIGHUP handler"))
                 .ok();
-            Self { terminate, hangup }
+            Self {
+                interrupt,
+                terminate,
+                hangup,
+            }
         }
         #[cfg(not(unix))]
         {
@@ -83,27 +92,22 @@ impl ShutdownSignals {
         {
             // `pending()` for an unregistered stream: it can never fire, and
             // selecting on it keeps the arm shape uniform.
-            let never = || std::future::pending::<()>();
-            let term = async {
-                match self.terminate.as_mut() {
+            async fn arm(signal: Option<&mut tokio::signal::unix::Signal>) {
+                match signal {
                     Some(s) => {
                         s.recv().await;
                     }
-                    None => never().await,
+                    None => std::future::pending::<()>().await,
                 }
-            };
-            let hup = async {
-                match self.hangup.as_mut() {
-                    Some(s) => {
-                        s.recv().await;
-                    }
-                    None => never().await,
-                }
-            };
+            }
             tokio::select! {
+                // Kept as the fallback for a host where the SIGINT stream
+                // could not be registered; whichever arm fires first names the
+                // same signal.
                 _ = tokio::signal::ctrl_c() => "SIGINT",
-                _ = term => "SIGTERM",
-                _ = hup => "SIGHUP",
+                _ = arm(self.interrupt.as_mut()) => "SIGINT",
+                _ = arm(self.terminate.as_mut()) => "SIGTERM",
+                _ = arm(self.hangup.as_mut()) => "SIGHUP",
             }
         }
         #[cfg(not(unix))]

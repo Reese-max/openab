@@ -128,11 +128,13 @@ issue #1474).
 - After a lease expires or the CP restarts, in-flight delegations are gone:
   initiators reconcile against their own deadlines and re-delegate. On a
   *graceful* stop the CP resolves them first: within `shutdown_drain_secs`
-  (the single ceiling — the flush, the close write and the process exit all
-  fit inside it) every initiator gets a synthesized `target_disconnected`
-  terminal (error `control plane shutting down`) and every serving runtime a
-  `cp/cancel`, ahead of the 1012 close; a `cp/delegate` that reaches the CP
-  mid-drain is refused `SATURATED` — back off and retry after reconnecting.
+  (the single ceiling — the flush, the close write and the drain itself all
+  fit inside it; the process then allows the HTTP listener one further second
+  of slack to finish its own bookkeeping) every initiator gets a synthesized
+  `target_disconnected` terminal (error `control plane shutting down`) and
+  every serving runtime a `cp/cancel`, ahead of the 1012 close; a
+  `cp/delegate` that reaches the CP mid-drain is refused `SATURATED` — back
+  off and retry after reconnecting.
   The process then exits 0 — including when the budget ran out with
   connections still open, which is logged as a warning (a non-zero status
   would read as a crash). A second SIGTERM/SIGINT/SIGHUP before it is gone is
