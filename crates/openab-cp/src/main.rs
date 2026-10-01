@@ -121,7 +121,11 @@ impl ShutdownSignals {
                         // error — reporting that as a SIGINT would look like a
                         // shutdown signal that never arrived. Wait instead.
                         if let Err(e) = tokio::signal::ctrl_c().await {
-                            warn!(error = %e, "cannot wait for SIGINT — the CP will not stop on ctrl-c");
+                            warn!(
+                                error = %e,
+                                "cannot wait for SIGINT — ctrl-c will no longer stop the CP \
+                                 gracefully (the OS default still kills it)"
+                            );
                             std::future::pending::<()>().await;
                         }
                     }

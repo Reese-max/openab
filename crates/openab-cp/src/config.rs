@@ -104,6 +104,11 @@ pub struct CpConfig {
     /// SIGKILL when ITS grace period ends, and a CP still waiting then gets
     /// the TCP reset this whole path exists to avoid).
     ///
+    /// It is not the process's whole exit budget: after the drain, the CP
+    /// allows the HTTP listener a further second (its own graceful wait) before
+    /// dropping it, so a peer that connected and stopped talking costs at most
+    /// that much.
+    ///
     /// Must be greater than 0. A zero budget would exit before any
     /// synthesized terminal or close frame reached a wire, while still having
     /// emitted the observer-side `delegation_completed` events — the two
