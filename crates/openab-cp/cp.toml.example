@@ -66,9 +66,10 @@ max_outbound_queue_bytes = 16777216
 # resolves every in-flight delegation (initiators get a synthesized
 # target_disconnected terminal, serving runtimes a cp/cancel), then each
 # connection flushes its queued outbound frames and closes with code 1012 —
-# and this budget is the ceiling for all of it, close write and process exit
-# included, so a peer that stops reading cannot push the exit past it. Must
-# be greater than 0: a zero budget would emit the observer-side terminal
+# and this budget is the ceiling for all of it, close write included, so a
+# peer that stops reading cannot push the exit past it; once the drain is done
+# the CP allows the HTTP listener one further second for its own bookkeeping.
+# Must be greater than 0: a zero budget would emit the observer-side terminal
 # events and then exit before any of the frames reached a wire.
 shutdown_drain_secs = 5
 

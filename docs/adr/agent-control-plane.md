@@ -552,9 +552,9 @@ recovery semantics:
   `cp/cancel`, both stamped `control plane shutting down`, and admissions
   racing the drain are refused `SATURATED` — then every connection closes
   with code 1012. `shutdown_drain_secs` is the single ceiling for all of it
-  (the flush, the close write, and the process exit), so a peer that stops
-  reading cannot push the exit past it; the process exits 0 once the drain
-  finishes. A drain that exhausts its budget also exits 0 — with a warning
+  (the flush, the close write, and the drain), so a peer that stops reading
+  cannot push it past its budget; the process exits 0 once the drain finishes
+  (plus the listener slack below). A drain that exhausts its budget also exits 0 — with a warning
   naming it — because a non-zero status would be indistinguishable from a
   crash to most supervisors, and the frames that did not make it are lost
   either way. A second shutdown signal before the process is gone is the

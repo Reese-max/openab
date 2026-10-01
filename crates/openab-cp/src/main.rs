@@ -117,7 +117,13 @@ impl ShutdownSignals {
                         s.recv().await;
                     }
                     None => {
-                        let _ = tokio::signal::ctrl_c().await;
+                        // A failed registration resolves immediately with an
+                        // error — reporting that as a SIGINT would look like a
+                        // shutdown signal that never arrived. Wait instead.
+                        if let Err(e) = tokio::signal::ctrl_c().await {
+                            warn!(error = %e, "cannot wait for SIGINT — the CP will not stop on ctrl-c");
+                            std::future::pending::<()>().await;
+                        }
                     }
                 }
             };
