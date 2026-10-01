@@ -225,6 +225,80 @@ fn is_shutdown_close(code: u16, reason: &str) -> bool {
     code == 1012 && reason == REASON_SHUTDOWN
 }
 
+/// Open a TCP connection to the CP and start an HTTP request that never
+/// finishes: the headers stop one CRLF short of complete, so the server keeps
+/// the connection waiting for the rest. Nothing in the CP's own shutdown can
+/// complete it — it exists to prove the shutdown does not wait on it.
+async fn stall_an_http_request(url: &str) -> tokio::net::TcpStream {
+    use tokio::io::AsyncWriteExt;
+    let host = url.trim_start_matches("ws://").trim_end_matches("/cp");
+    let mut stream = TcpStream::connect(host).await.expect("connecting");
+    stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n")
+        .await
+        .expect("sending a partial request");
+    stream
+}
+
+#[tokio::test]
+async fn a_stalled_http_request_cannot_pin_the_shutdown() {
+    // A CP whose drain waits for the listener's own graceful shutdown is pinned
+    // by a peer that opened a socket and then said nothing: axum ends that wait
+    // when the last in-flight request finishes, so the drain would never start
+    // and the process would sit until the orchestrator's SIGKILL — the reset
+    // this whole path exists to prevent.
+    let mut cp = spawn_cp().await;
+    let mut initiator = connect_retry(&cp.url, KEY).await;
+    register(&mut initiator, "koudu", "i-1").await;
+    let _stalled = stall_an_http_request(&cp.url).await;
+
+    send_sigterm(cp.child.id().expect("the CP is still running"));
+
+    // The drain runs regardless of the stalled request: the live socket still
+    // gets its close frame.
+    let (code, reason) = await_close(&mut initiator).await;
+    assert!(
+        is_shutdown_close(code, &reason),
+        "the drain must run past a stalled request — close was {code} {reason:?}"
+    );
+    // And the process leaves on its own instead of waiting to be killed.
+    let status = tokio::time::timeout(Duration::from_secs(30), cp.child.wait())
+        .await
+        .expect("a stalled request must not pin the process past the drain budget")
+        .expect("reaping the CP");
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+#[tokio::test]
+async fn a_second_signal_exits_immediately_while_the_drain_is_pending() {
+    // The operator's escape hatch has to cover the whole window between the
+    // first signal and the exit — including a listener that will not finish its
+    // own wait. Armed only after the drain, it would never fire there.
+    let mut cp = spawn_cp().await;
+    let mut initiator = connect_retry(&cp.url, KEY).await;
+    register(&mut initiator, "koudu", "i-1").await;
+    let _stalled = stall_an_http_request(&cp.url).await;
+
+    let pid = cp.child.id().expect("the CP is still running");
+    send_sigterm(pid);
+    // Observed close frame: the drain has started and the listener is all that
+    // is left keeping the process alive.
+    let (code, reason) = await_close(&mut initiator).await;
+    assert!(is_shutdown_close(code, &reason), "{code} {reason:?}");
+
+    send_sigterm(pid);
+
+    let status = tokio::time::timeout(Duration::from_secs(20), cp.child.wait())
+        .await
+        .expect("a second signal must force the exit, not wait out the budget")
+        .expect("reaping the CP");
+    assert_eq!(
+        status.code(),
+        Some(143),
+        "a forced exit reports 128 + SIGTERM, not a signal death: {status:?}"
+    );
+}
+
 #[tokio::test]
 async fn sigterm_resolves_in_flight_delegations_before_the_process_exits() {
     // The whole point of the issue, over a real socket and a real process:

@@ -551,10 +551,15 @@ recovery semantics:
   synthesized `target_disconnected` terminal and serving runtimes a
   `cp/cancel`, both stamped `control plane shutting down`, and admissions
   racing the drain are refused `SATURATED` — then every connection closes
-  with code 1012, all inside `shutdown_drain_secs` plus at most one
-  `write_timeout_secs` for a stalled close write. A second shutdown signal
-  during the drain is the operator's "stop waiting": the process exits
-  immediately with the signal's conventional status (128 + signum). A
+  with code 1012. `shutdown_drain_secs` is the single ceiling for all of it
+  (the flush, the close write, and the process exit), so a peer that stops
+  reading cannot push the exit past it; the process exits 0 once the drain
+  finishes. A second shutdown signal before the process is gone is the
+  operator's "stop waiting" and exits immediately with the signal's
+  conventional status (128 + signum — 143 for SIGTERM). Nothing waits on the
+  HTTP listener's own graceful shutdown: the drain is spawned at the signal,
+  because a peer that opened a socket and then stopped sending would
+  otherwise pin that wait indefinitely and take the drain down with it. A
   *hard* restart (SIGKILL, crash, drain budget exhausted) is equivalent to
   every lease expiring at once *with* the connection closure that implies —
   except that the CP is not there to send it: the in-flight table and the

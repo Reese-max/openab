@@ -97,12 +97,18 @@ pub struct CpConfig {
     /// On shutdown every in-flight delegation is resolved first — the
     /// initiator gets a synthesized `target_disconnected` terminal and the
     /// serving runtime a `cp/cancel` — then each connection flushes its
-    /// queued outbound frames and sends its close frame, all inside this
-    /// budget. A stalled peer's close write is additionally bounded by
-    /// `write_timeout_secs`, so it can never hold the CP past this budget
-    /// plus one write timeout. 0 disables the wait: connections are
-    /// signalled and the process exits as soon as the listener is closed
-    /// (sockets still get their close frames if they flush in time).
+    /// queued outbound frames and sends its close frame. This budget is the
+    /// ceiling for ALL of it: the flush, the close write and the process exit
+    /// are remainders of one deadline, so a peer that stops reading cannot
+    /// push the exit past it (that is the point — an orchestrator escalates to
+    /// SIGKILL when ITS grace period ends, and a CP still waiting then gets
+    /// the TCP reset this whole path exists to avoid).
+    ///
+    /// Must be greater than 0. A zero budget would exit before any
+    /// synthesized terminal or close frame reached a wire, while still having
+    /// emitted the observer-side `delegation_completed` events — the two
+    /// surfaces would disagree by construction, and the shutdown would be
+    /// indistinguishable from being killed.
     #[serde(default = "default_shutdown_drain_secs")]
     pub shutdown_drain_secs: u64,
     /// Maximum size of prompt/result excerpts mirrored to observers in
@@ -339,6 +345,13 @@ impl CpConfig {
         // Zero would refuse every delegation the CP could ever route.
         if self.max_inflight_delegations == 0 {
             bail!("max_inflight_delegations must be at least 1");
+        }
+        // Zero would exit the process before any synthesized terminal or close frame
+        // reached a wire — while the observer-side `delegation_completed`
+        // events had already been emitted, so the two surfaces would disagree
+        // and the shutdown would be indistinguishable from a SIGKILL.
+        if self.shutdown_drain_secs == 0 {
+            bail!("shutdown_drain_secs must be greater than 0");
         }
         // Zero would clamp every uncapped identity to no capacity at all, so
         // every delegation to it would be SATURATED.

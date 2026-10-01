@@ -59,7 +59,9 @@ issue #1474).
   reconnect, re-authenticate, and re-register. Process shutdown (SIGTERM,
   SIGHUP, SIGINT — e.g. `docker stop`, ECS, k8s) uses code **1012**
   (service restart) with reason `control plane shutting down` instead: same
-  recovery, different signal — your client did nothing wrong.
+  recovery, different signal — your client did nothing wrong. Shutdown does
+  not wait for the HTTP listener to finish: the drain starts at the signal,
+  so a peer that connected and then stopped sending cannot delay your close.
 - A peer that stops reading is disconnected: any single outbound write that
   blocks longer than `write_timeout_secs` is treated as a dead peer, so keep
   draining the socket even while busy. The same rule applies to the queue
@@ -126,12 +128,17 @@ issue #1474).
 - After a lease expires or the CP restarts, in-flight delegations are gone:
   initiators reconcile against their own deadlines and re-delegate. On a
   *graceful* stop the CP resolves them first: within `shutdown_drain_secs`
-  (plus at most one `write_timeout_secs` for a stalled close write) every
-  initiator gets a synthesized `target_disconnected` terminal (error
-  `control plane shutting down`) and every serving runtime a `cp/cancel`,
-  ahead of the 1012 close; a `cp/delegate` that reaches the CP mid-drain is
-  refused `SATURATED` — back off and retry after reconnecting. A SIGKILL
-  still leaves reconciliation to your deadlines.
+  (the single ceiling — the flush, the close write and the process exit all
+  fit inside it) every initiator gets a synthesized `target_disconnected`
+  terminal (error `control plane shutting down`) and every serving runtime a
+  `cp/cancel`, ahead of the 1012 close; a `cp/delegate` that reaches the CP
+  mid-drain is refused `SATURATED` — back off and retry after reconnecting.
+  The process then exits 0. A second SIGTERM/SIGINT/SIGHUP before it is gone
+  is your "stop waiting": it exits immediately with 128 + signum (143 for
+  SIGTERM). A SIGKILL still leaves reconciliation to your deadlines. An
+  initiator whose outbound queue was already full cannot receive its
+  synthesized terminal — the CP logs that refusal; the delegation is then
+  reconciled by the initiator's own deadline, like any lost result.
 
 ## Observer surface (lobby)
 

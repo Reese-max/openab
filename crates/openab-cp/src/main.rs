@@ -1,10 +1,11 @@
 //! Standalone control-plane binary.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tracing::info;
+use tracing::{info, warn};
 
 use openab_cp::config::CpConfig;
 use openab_cp::server::{app, graceful_shutdown, run_sweeper, AppState};
@@ -92,37 +93,87 @@ async fn main() -> Result<()> {
     );
 
     let state = Arc::new(AppState::new(cfg));
+    let drain_budget = Duration::from_secs(state.cfg.shutdown_drain_secs);
+    // The process's exit is bounded by the drain budget plus slack for the
+    // listener's own bookkeeping. One knob, one bound: an orchestrator
+    // escalates to SIGKILL at the end of its grace period, so the CP's own
+    // deadline has to be the shorter one.
+    let hard_bound = drain_budget + Duration::from_secs(1);
     let sweeper = tokio::spawn(run_sweeper(state.clone()));
 
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .with_context(|| format!("binding {listen}"))?;
-    axum::serve(listener, app(state.clone()))
-        .with_graceful_shutdown(async {
+
+    // The shutdown sequence is SPAWNED rather than awaited after the listener.
+    // Ordering it after `serve` was a real defect: axum's graceful shutdown
+    // ends when the last in-flight HTTP request finishes, and a peer that
+    // opened a socket and then said nothing (a half-sent request, a stalled
+    // upgrade) pins that wait for as long as the orchestrator allows the
+    // process to live — so the drain would never start, and the CP would be
+    // SIGKILLed with its delegations unresolved. Spawning it makes the drain
+    // begin the instant the signal lands, whatever hyper is doing.
+    let (stop_accepting_tx, stop_accepting_rx) = tokio::sync::oneshot::channel::<()>();
+    let (drained_tx, drained_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn({
+        let state = Arc::clone(&state);
+        async move {
             let signal = shutdown_signal().await;
             info!(signal, "shutdown signal received — draining connections");
-        })
-        .await?;
-
-    // A second signal while the drain is still running is the operator's
-    // "stop waiting": exit immediately with the signal's conventional
-    // status. `shutdown_signal` registers fresh streams each call, so the
-    // repeat SIGINT/SIGTERM/SIGHUP still resolves it — the drain itself is
-    // bounded, so this only shortens a wait, never causes one.
-    let force_quit = tokio::spawn(async {
-        let signal = shutdown_signal().await;
-        tracing::warn!(signal, "second shutdown signal — forcing immediate exit");
-        std::process::exit(signal_exit_code(signal));
+            // A second signal at ANY point before the process exits is the
+            // operator's "stop waiting": exit immediately with the signal's
+            // conventional status (128 + signum). Armed before the drain and
+            // deliberately left armed — the drain and the listener's wait are
+            // separate waits, and the escape hatch has to cover both. The task
+            // ends with the process if it never fires.
+            tokio::spawn(async {
+                let signal = shutdown_signal().await;
+                warn!(signal, "second shutdown signal — forcing immediate exit");
+                std::process::exit(signal_exit_code(signal));
+            });
+            // Nothing new may enter a CP that is leaving.
+            let _ = stop_accepting_tx.send(());
+            graceful_shutdown(&state).await;
+            let _ = drained_tx.send(());
+        }
     });
 
-    // The listener has stopped accepting and in-flight HTTP work is done;
-    // the WS connection tasks are detached spawns still running. Give them a
-    // real shutdown — synthesized terminals, close frames, bounded drain —
-    // instead of letting process exit reset their sockets. The sweeper
-    // stops last: a lease/deadline expiry during the drain still
-    // synthesizes normally.
-    graceful_shutdown(&state).await;
-    force_quit.abort();
+    // The listener stops accepting as soon as the signal lands, and the wait
+    // for it is bounded by the same hard bound — hyper's bookkeeping must not
+    // be able to outlive the drain it is supposed to follow.
+    let serving =
+        axum::serve(listener, app(Arc::clone(&state))).with_graceful_shutdown(async move {
+            let _ = stop_accepting_rx.await;
+        });
+    let finished = tokio::time::timeout(hard_bound, async {
+        tokio::join!(
+            async {
+                // The drain is the shutdown: the synthesized terminals and the
+                // close frames get their chance to reach the wire here.
+                let _ = drained_rx.await;
+            },
+            async {
+                match tokio::time::timeout(hard_bound, serving).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!(error = %e, "listener stopped with an error"),
+                    Err(_) => warn!(
+                        bound_secs = hard_bound.as_secs(),
+                        "the listener's graceful wait outlived the shutdown bound — dropping it"
+                    ),
+                }
+            },
+        );
+    })
+    .await;
+    if finished.is_err() {
+        warn!(
+            bound_secs = hard_bound.as_secs(),
+            "shutdown did not finish within its bound — exiting with the drain unfinished"
+        );
+    }
+
+    // Only now: the sweeper exists to keep registrations and delegations
+    // honest, and during a shutdown its findings would race the closes above.
     sweeper.abort();
     let _ = sweeper.await;
     info!("openab-cp stopped");

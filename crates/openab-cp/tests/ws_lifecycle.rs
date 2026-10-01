@@ -898,6 +898,11 @@ async fn spawn_cp_process() -> (tokio::process::Child, String, std::path::PathBu
     let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_openab-cp"))
         .arg("--config")
         .arg(&cfg_path)
+        // Not inherited and not piped: the child's `tracing` output would
+        // otherwise interleave with the harness log, and a pipe nobody drains
+        // can block the child mid-write.
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .kill_on_drop(true)
         .spawn()
         .expect("spawn openab-cp");
@@ -927,10 +932,11 @@ async fn a_second_signal_latching_mid_close_still_sends_a_close_frame() {
     graceful_shutdown(&state).await;
 
     let closed = wait_closed(&mut ws, Duration::from_secs(5)).await;
-    assert!(
-        matches!(closed, Some(Closed::Frame { .. })),
-        "a second signal mid-close must not reduce the peer's close frame \
-         to a bare reset — got {closed:?}"
+    assert_eq!(
+        closed,
+        Some(shutdown_close()),
+        "a second signal mid-close must not reduce the peer's close frame to \
+         a bare reset — nor downgrade the reason it is being told: got {closed:?}"
     );
 }
 

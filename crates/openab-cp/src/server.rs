@@ -64,6 +64,9 @@ pub struct AppState {
     /// subscribes — including pre-registration sockets, which the
     /// per-connection signal held by the registry cannot reach.
     shutdown: ShutdownTx,
+    /// When the current drain expires, latched together with `shutdown`.
+    /// Every budget in the drain is a remainder of this one instant.
+    shutdown_deadline: Mutex<Option<Instant>>,
 }
 
 impl AppState {
@@ -76,6 +79,7 @@ impl AppState {
             rpc_id: AtomicU64::new(1),
             conns: Mutex::new(BTreeMap::new()),
             shutdown: shutdown_signal(),
+            shutdown_deadline: Mutex::new(None),
         }
     }
 
@@ -91,9 +95,28 @@ impl AppState {
 
     /// Latch the shutdown reason: every live connection task closes, and a
     /// connection upgraded mid-drain sees the latched reason at subscribe
-    /// time.
+    /// time. The drain deadline is latched with it, so every connection
+    /// budgets against the SAME instant rather than each starting a fresh
+    /// `shutdown_drain_secs` when it happens to leave its main loop — a
+    /// connection that noticed the signal late must not be granted a longer
+    /// life than the drain it is part of.
     fn begin_shutdown(&self, reason: &'static str) {
+        let deadline = Instant::now() + Duration::from_secs(self.cfg.shutdown_drain_secs);
+        *self.shutdown_deadline.lock() = Some(deadline);
         self.shutdown.send_replace(Some(reason));
+    }
+
+    /// The instant the current drain expires. `None` until the CP begins
+    /// shutting down.
+    fn shutdown_deadline(&self) -> Option<Instant> {
+        *self.shutdown_deadline.lock()
+    }
+
+    /// Whether the CP has begun draining. Distinguishes "this peer stopped
+    /// reading" from "the CP is leaving" when a frame cannot be delivered —
+    /// the two deserve different explanations.
+    pub fn shutting_down(&self) -> bool {
+        self.shutdown_deadline.lock().is_some()
     }
 
     /// Resolves when no live connection permits remain — every connection
@@ -642,13 +665,18 @@ async fn handle_connection(
     // path the outbound queue is flushed FIRST: the synthesized terminals
     // and cancels that `graceful_shutdown` queued must reach the wire ahead
     // of the close frame. `rx.close()` refuses any further enqueue, so the
-    // loop ends on its own once the backlog is flushed; the drain deadline
-    // bounds the backlog and `write_timeout` bounds each stalled write.
+    // loop ends on its own once the backlog is flushed.
+    //
+    // Every budget below is a remainder of ONE instant — the deadline latched
+    // when the CP began draining — not a fresh `shutdown_drain_secs` per
+    // connection and not a fresh one per write. That is what makes the
+    // documented bound true: `shutdown_drain_secs` covers the whole drain,
+    // the flush and the final close write included.
     if let Some(reason) = close.process_reason() {
         rx.close();
-        let drain_deadline = Instant::now() + Duration::from_secs(state.cfg.shutdown_drain_secs);
+        let deadline = state.shutdown_deadline().unwrap_or_else(Instant::now);
         while let Some(text) = rx.recv().await {
-            let budget = drain_deadline.saturating_duration_since(Instant::now());
+            let budget = deadline.saturating_duration_since(Instant::now());
             if budget.is_zero() {
                 break;
             }
@@ -665,12 +693,27 @@ async fn handle_connection(
             reason,
             "closing connection: control plane shutting down"
         );
-        // Bounded like every other write: a peer that has stopped reading
+        // Bounded like every other write — a peer that has stopped reading
         // must not be able to hold teardown (and its quota slot) by refusing
-        // to accept the close frame. The write is NOT raced against the
-        // close watch: a second signal latching mid-write (a lease sweep
+        // to accept the close frame — but by what is LEFT of the drain, not by
+        // a fresh timeout: a stalled peer cannot push the process's exit past
+        // the budget the operator configured. The write is NOT raced against
+        // the close watch: a second signal latching mid-write (a lease sweep
         // landing mid-drain) must not eat the promised close frame.
-        send_final_frame(&mut sink, restart_close(reason), write_timeout).await;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            send_final_frame(
+                &mut sink,
+                restart_close(reason),
+                remaining.min(write_timeout),
+            )
+            .await;
+        } else {
+            warn!(
+                handle,
+                "drain deadline elapsed before this connection's close frame could be written"
+            );
+        }
     } else if let Some(reason) = cp_close_reason {
         info!(
             agent = %format!("{}/{}", identity.namespace, identity.name),
@@ -1021,9 +1064,23 @@ fn handle_frame(state: &Arc<AppState>, handle: u64, text: &str) -> Option<String
                         // already committed (entry removed, capacity
                         // released, terminal emitted), so the teardown finds
                         // nothing to fail and synthesizes nothing.
-                        state
-                            .registry
-                            .signal_shutdown(initiator_handle, REASON_BACKPRESSURE);
+                        //
+                        // Exception: during the drain the queue was closed on
+                        // purpose, not overflowed, and the connection is on its
+                        // way out with the shutdown close. Naming
+                        // backpressure there would tell a client its queue
+                        // overflowed when the real cause is a deploy.
+                        if state.shutting_down() {
+                            info!(
+                                initiator_handle,
+                                "delegation terminal undeliverable during shutdown — \
+                                 the connection is closing with the shutdown reason"
+                            );
+                        } else {
+                            state
+                                .registry
+                                .signal_shutdown(initiator_handle, REASON_BACKPRESSURE);
+                        }
                     }
                     if !delivered {
                         info!(
@@ -1169,15 +1226,17 @@ pub async fn run_sweeper(state: Arc<AppState>) {
 }
 
 /// Graceful shutdown (SIGTERM/SIGHUP/SIGINT): resolve every in-flight
-/// delegation with synthesized terminal frames, signal every connection to
-/// close, then wait — bounded by `shutdown_drain_secs` — for the connection
-/// tasks to flush their queues and exit.
+/// delegation with synthesized terminal frames, latch the process-wide close
+/// signal, then wait — bounded by the SAME `shutdown_drain_secs` deadline the
+/// connection tasks are working against — for the connection tasks to flush
+/// their queues and exit.
 ///
-/// This runs AFTER the HTTP listener has stopped accepting (axum's graceful
-/// shutdown already resolved); the WebSocket connection tasks are detached
-/// spawns that keep running until told to close. The caller stops the
-/// sweeper and exits after this returns — the sweeper deliberately outlives
-/// the drain so a mid-drain lease/deadline expiry still synthesizes
+/// Runs concurrently with the listener's own graceful shutdown, NOT after it:
+/// hyper's wait ends when the last in-flight HTTP request finishes, and a peer
+/// that opened a socket and then said nothing would pin that wait for as long
+/// as the orchestrator lets the process live — taking the drain down with it.
+/// The caller stops the sweeper once this returns; the sweeper deliberately
+/// outlives the drain so a mid-drain lease/deadline expiry still synthesizes
 /// normally.
 ///
 /// Order is deliberate: terminals are synthesized BEFORE the close signal
@@ -1188,25 +1247,43 @@ pub async fn run_sweeper(state: Arc<AppState>) {
 pub async fn graceful_shutdown(state: &Arc<AppState>) {
     info!("draining connections and resolving in-flight delegations");
     let mut next = || state.next_rpc_id();
+    let mut undeliverable = 0usize;
     for (inst, frame) in
         state
             .router
             .fail_all(&state.registry, &state.events, REASON_SHUTDOWN, &mut next)
     {
-        let _ = inst.tx.try_send(frame);
+        if inst.tx.try_send(frame).is_err() {
+            // The peer's bounded queue is already full (or was closed by a
+            // connection leaving the drain): the terminal cannot be delivered
+            // and the observer event is already emitted, so the two surfaces
+            // disagree — unavoidably, since a full queue is exactly a peer
+            // that stopped reading. Named at warn level because the drain is
+            // the last chance this delegation could ever be resolved for that
+            // initiator, and its only remaining outcome is deadline
+            // reconciliation on the client.
+            undeliverable += 1;
+            warn!(
+                agent = %inst.logical_id(),
+                handle = inst.handle,
+                "shutdown terminal could not be queued — the peer's outbound \
+                 queue refused it; the delegation will be reconciled by the \
+                 initiator's deadline"
+            );
+        }
     }
+    // The deadline is latched with the close signal below, and covers
+    // everything after it.
+    let drain = Duration::from_secs(state.cfg.shutdown_drain_secs);
     state.begin_shutdown(REASON_SHUTDOWN);
-    match tokio::time::timeout(
-        Duration::from_secs(state.cfg.shutdown_drain_secs),
-        state.connections_drained(),
-    )
-    .await
-    {
-        Ok(()) => info!("all connections drained"),
-        Err(_) => warn!(
+    let outcome = tokio::time::timeout(drain, state.connections_drained()).await;
+    if outcome.is_err() {
+        warn!(
             drain_secs = state.cfg.shutdown_drain_secs,
-            "shutdown drain budget elapsed — exiting with connections still open"
-        ),
+            undeliverable, "shutdown drain budget elapsed — exiting with connections still open"
+        );
+    } else {
+        info!(undeliverable, "all connections drained");
     }
 }
 
@@ -1443,6 +1520,79 @@ mod tests {
         ack["result"]["admission"]
             .as_u64()
             .expect("token on the ack")
+    }
+
+    #[tokio::test]
+    async fn shutdown_survives_an_initiator_whose_queue_is_already_full() {
+        // The one outcome the drain cannot repair: an initiator whose bounded
+        // queue is full when the terminal is synthesized. The frame cannot be
+        // delivered — that is what "bounded" means — so the two surfaces
+        // disagree by construction: the observer event is emitted, the wire
+        // frame is refused. What must NOT happen is a panic, a delegation row
+        // left behind, a leaked serving reservation, or a drain that never
+        // ends. The refusal is logged at warn level, because the drain is the
+        // last chance that delegation had to be resolved for that initiator.
+        let state = state_with("");
+        let (h_i, mut rx_i) = register_test_instance(&state, "koudu", AgentType::Primary, 4);
+        let (h_w, mut rx_w) = register_test_instance(&state, "worker-1", AgentType::Worker, 1);
+        let (_h_o, mut rx_o) = register_test_instance(&state, "lobby", AgentType::Observer, 0);
+        delegate_through_handler(&state, h_i, "d-1", "worker-1");
+        rx_w.try_recv().expect("worker received the forward");
+        while rx_o.try_recv().is_ok() {}
+
+        // Nobody drains this queue — exactly the situation a peer that stopped
+        // reading creates, and the only way to make `try_send` refuse.
+        let filler = "x".repeat(64 * 1024);
+        let mut enqueued = 0;
+        while state
+            .registry
+            .get(h_i)
+            .unwrap()
+            .tx
+            .try_send(filler.clone())
+            .is_ok()
+        {
+            enqueued += 1;
+            assert!(enqueued < 1000, "the bounded queue must refuse eventually");
+        }
+        assert!(enqueued > 0, "the first frame must fit");
+
+        graceful_shutdown(&state).await;
+
+        assert_eq!(
+            state.router.inflight_count(),
+            0,
+            "the delegation must still be ended"
+        );
+        assert_eq!(
+            state.registry.get(h_w).unwrap().active_sessions,
+            0,
+            "the serving reservation must still be released"
+        );
+        assert!(
+            state.shutting_down(),
+            "the CP must stay latched as draining afterwards"
+        );
+        let mut terminal_queued = false;
+        while let Ok(frame) = rx_i.try_recv() {
+            if frame.contains("cp/delegate_result") {
+                terminal_queued = true;
+            }
+        }
+        assert!(
+            !terminal_queued,
+            "a full queue cannot take the terminal — the documented exception"
+        );
+        let events: Vec<String> = std::iter::from_fn(|| rx_o.try_recv().ok()).collect();
+        assert!(
+            events.iter().any(|e| e.contains("delegation_completed")),
+            "the observer-side terminal is still emitted: that is why the two \
+             surfaces disagree, and why the refusal must be logged: {events:?}"
+        );
+        assert!(
+            rx_w.try_recv().unwrap().contains("cp/cancel"),
+            "the serving runtime's queue was healthy, so its cancel must land"
+        );
     }
 
     #[test]
