@@ -92,22 +92,22 @@ pub struct CpConfig {
     pub write_timeout_secs: u64,
 
     /// How long the CP waits for live connections to drain after a shutdown
-    /// signal (SIGTERM/SIGHUP/SIGINT) before the process exits.
+    /// signal (SIGTERM/SIGHUP/SIGINT).
     ///
     /// On shutdown every in-flight delegation is resolved first — the
     /// initiator gets a synthesized `target_disconnected` terminal and the
     /// serving runtime a `cp/cancel` — then each connection flushes its
     /// queued outbound frames and sends its close frame. This budget is the
-    /// ceiling for ALL of it: the flush, the close write and the process exit
-    /// are remainders of one deadline, so a peer that stops reading cannot
-    /// push the exit past it (that is the point — an orchestrator escalates to
-    /// SIGKILL when ITS grace period ends, and a CP still waiting then gets
-    /// the TCP reset this whole path exists to avoid).
+    /// ceiling for all of THAT: the flush and the close write are remainders
+    /// of one deadline, so a peer that stops reading cannot push the drain past
+    /// it (that is the point — an orchestrator escalates to SIGKILL when ITS
+    /// grace period ends, and a CP still waiting then gets the TCP reset this
+    /// whole path exists to avoid).
     ///
-    /// It is not the process's whole exit budget: after the drain, the CP
-    /// allows the HTTP listener a further second (its own graceful wait) before
-    /// dropping it, so a peer that connected and stopped talking costs at most
-    /// that much.
+    /// It is not the process's whole exit budget: once the drain is done the CP
+    /// allows the HTTP listener one further second for its own graceful wait
+    /// before dropping it, so size your orchestrator's grace period with that
+    /// second of headroom.
     ///
     /// Must be greater than 0. A zero budget would exit before any
     /// synthesized terminal or close frame reached a wire, while still having
