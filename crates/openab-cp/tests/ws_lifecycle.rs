@@ -874,7 +874,18 @@ async fn shutdown_closes_sockets_that_never_registered() {
 /// SIGTERM before SIGKILL, and the binary used to die by default disposition
 /// without ever running a shutdown path.
 #[cfg(unix)]
-async fn spawn_cp_process() -> (tokio::process::Child, String, std::path::PathBuf) {
+/// The temp config a spawned CP reads, removed when the guard drops — including
+/// on a panicking assert, which otherwise leaves one file per failed run in
+/// `/tmp`.
+struct CfgGuard(std::path::PathBuf);
+
+impl Drop for CfgGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+async fn spawn_cp_process() -> (tokio::process::Child, String, CfgGuard) {
     // Grab an ephemeral port, release it, hand it to the child — the usual
     // tiny race, absorbed by `connect_retry`.
     let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -906,7 +917,11 @@ async fn spawn_cp_process() -> (tokio::process::Child, String, std::path::PathBu
         .kill_on_drop(true)
         .spawn()
         .expect("spawn openab-cp");
-    (child, format!("ws://127.0.0.1:{port}/cp"), cfg_path)
+    (
+        child,
+        format!("ws://127.0.0.1:{port}/cp"),
+        CfgGuard(cfg_path),
+    )
 }
 
 #[tokio::test]
@@ -947,7 +962,7 @@ async fn sigterm_and_sighup_run_the_drain_and_exit_cleanly() {
     // SIGHUP shares the path. Each must produce the graceful close on live
     // sockets and a clean exit code — never the old default-disposition kill.
     for sig in ["TERM", "HUP"] {
-        let (mut child, url, cfg_path) = spawn_cp_process().await;
+        let (mut child, url, _cfg) = spawn_cp_process().await;
         let mut ws = connect_retry(&url).await;
         assert_eq!(
             register(&mut ws, "i-1").await["result"]["protocol_version"],
@@ -975,6 +990,5 @@ async fn sigterm_and_sighup_run_the_drain_and_exit_cleanly() {
             status.success(),
             "SIG{sig}: the CP must exit cleanly, got {status}"
         );
-        let _ = std::fs::remove_file(&cfg_path);
     }
 }

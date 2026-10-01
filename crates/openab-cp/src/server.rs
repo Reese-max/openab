@@ -322,6 +322,24 @@ async fn send_final_frame(
     let _ = tokio::time::timeout(write_timeout, sink.send(msg)).await;
 }
 
+/// Budget for the last frame of a connection that is ending: the write timeout,
+/// clipped to what is left of the drain once the CP is shutting down.
+///
+/// The main-loop teardown already spends the remaining drain directly; this
+/// covers the paths that never reach the main loop — a socket caught mid-upgrade
+/// by the drain, a pre-registration close, a refused register frame. Without it
+/// those writes could still hold their task for a full `write_timeout_secs`
+/// (30s by default) after a 5s drain expired, so `shutdown_drain_secs` would
+/// not really be the ceiling the docs promise.
+fn final_frame_budget(state: &AppState, write_timeout: Duration) -> Duration {
+    match state.shutdown_deadline() {
+        Some(deadline) => deadline
+            .saturating_duration_since(Instant::now())
+            .min(write_timeout),
+        None => write_timeout,
+    }
+}
+
 async fn ws_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -399,7 +417,12 @@ async fn handle_connection(
     // only reports transitions that postdate the subscription, so the
     // already-latched reason is checked once explicitly.
     if let Some(reason) = close.process_reason() {
-        send_final_frame(&mut sink, restart_close(reason), write_timeout).await;
+        send_final_frame(
+            &mut sink,
+            restart_close(reason),
+            final_frame_budget(&state, write_timeout),
+        )
+        .await;
         return;
     }
 
@@ -429,7 +452,7 @@ async fn handle_connection(
                 Some(reason) => restart_close(reason),
                 None => policy_close(close.reason().unwrap_or(REASON_SHUTDOWN)),
             };
-            send_final_frame(&mut sink, frame, write_timeout).await;
+            send_final_frame(&mut sink, frame, final_frame_budget(&state, write_timeout)).await;
             return;
         }
     } {
@@ -447,7 +470,7 @@ async fn handle_connection(
             send_final_frame(
                 &mut sink,
                 policy_close(REASON_REGISTER_TIMEOUT),
-                write_timeout,
+                final_frame_budget(&state, write_timeout),
             )
             .await;
             return;
@@ -460,7 +483,7 @@ async fn handle_connection(
             send_final_frame(
                 &mut sink,
                 Message::Text(serde_json::to_string(&resp).expect("serializable").into()),
-                write_timeout,
+                final_frame_budget(&state, write_timeout),
             )
             .await;
             return;
@@ -523,7 +546,7 @@ async fn handle_connection(
             send_final_frame(
                 &mut sink,
                 Message::Text(serde_json::to_string(&resp).expect("serializable").into()),
-                write_timeout,
+                final_frame_budget(&state, write_timeout),
             )
             .await;
             return;
@@ -579,7 +602,7 @@ async fn handle_connection(
                 None => close.reason().map(policy_close),
             };
             if let Some(frame) = frame {
-                send_final_frame(&mut sink, frame, write_timeout).await;
+                send_final_frame(&mut sink, frame, final_frame_budget(&state, write_timeout)).await;
             }
         }
         // `_registered` runs teardown on the way out.

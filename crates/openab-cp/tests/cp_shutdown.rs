@@ -52,7 +52,7 @@ fn free_port() -> u16 {
     port
 }
 
-fn config_file(port: u16) -> PathBuf {
+fn config_file(port: u16, extra: &str) -> PathBuf {
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
         "openab-cp-sigterm-{}-{seq}.toml",
@@ -62,7 +62,7 @@ fn config_file(port: u16) -> PathBuf {
         r#"
 listen = "127.0.0.1:{port}"
 register_timeout_secs = 30
-shutdown_drain_secs = 5
+{extra}
 
 [[agents]]
 key = "{KEY}"
@@ -98,8 +98,13 @@ impl Drop for Cp {
 
 /// Start the real `openab-cp` binary on a free loopback port.
 async fn spawn_cp() -> Cp {
+    spawn_cp_with("shutdown_drain_secs = 5").await
+}
+
+/// Start the real binary with extra config lines injected.
+async fn spawn_cp_with(extra: &str) -> Cp {
     let port = free_port();
-    let config = config_file(port);
+    let config = config_file(port, extra);
     let child = Command::new(env!("CARGO_BIN_EXE_openab-cp"))
         .arg("--config")
         .arg(&config)
@@ -223,6 +228,34 @@ fn is_shutdown_close(code: u16, reason: &str) -> bool {
     // nothing about a deploy is a policy violation, and the client should
     // reconnect rather than fix anything.
     code == 1012 && reason == REASON_SHUTDOWN
+}
+
+#[tokio::test]
+async fn the_drain_budget_bounds_the_shutdown_not_the_process_lifetime() {
+    // `shutdown_drain_secs` is a shutdown budget, not a lifetime: a CP with a
+    // one-second drain must still be serving three seconds later, when no
+    // signal has been delivered. A bound armed at startup instead of at the
+    // signal would end the process on its own — turning a stop-mid-delegation
+    // bug into "the CP vanishes", with no signal ever involved.
+    let mut cp = spawn_cp_with("shutdown_drain_secs = 1").await;
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let mut ws = connect_retry(&cp.url, KEY).await;
+    let ack = register(&mut ws, "koudu", "i-1").await;
+    assert_eq!(
+        ack["result"]["protocol_version"], 1,
+        "the CP must still be serving after 3x its drain budget with no signal: {ack}"
+    );
+
+    // And the budget still applies to the shutdown itself.
+    send_sigterm(cp.child.id().expect("the CP is still running"));
+    let (code, reason) = await_close(&mut ws).await;
+    assert!(is_shutdown_close(code, &reason), "{code} {reason:?}");
+    let status = tokio::time::timeout(Duration::from_secs(20), cp.child.wait())
+        .await
+        .expect("the CP must exit after SIGTERM")
+        .expect("reaping the CP");
+    assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
 /// Open a TCP connection to the CP and start an HTTP request that never

@@ -18,46 +18,99 @@ struct Cli {
     config: String,
 }
 
-/// Wait for a shutdown signal: SIGINT (ctrl-c) on every platform, plus
-/// SIGTERM and SIGHUP on unix — the signals `docker stop`, ECS and k8s send
-/// before escalating to SIGKILL. Without handlers the default disposition
-/// kills the process outright: no close frames, no terminal results, and
-/// runtimes see TCP resets.
-async fn shutdown_signal() -> &'static str {
+/// Slack the listener gets, after the drain has finished, to complete its own
+/// graceful shutdown.
+///
+/// The CP has no long-lived HTTP route: `/health` answers immediately and
+/// `/cp` completes its response as soon as the handshake is done (the WebSocket
+/// runs detached). So anything still pending once the drain ends is a peer that
+/// connected and then stopped talking — not work worth waiting for. The
+/// orchestrator's grace period is the real deadline; this only decides how much
+/// of it the CP spends on a socket that will never answer.
+const LISTENER_SHUTDOWN_SLACK: Duration = Duration::from_secs(1);
+
+/// The signals that mean "shut down": SIGINT (ctrl-c) on every platform, plus
+/// SIGTERM and SIGHUP on unix — what `docker stop`, ECS and k8s send before
+/// escalating to SIGKILL. Without handlers the default disposition kills the
+/// process outright: no close frames, no terminal results, runtimes see TCP
+/// resets, and in-flight delegations are left to their clients' deadlines.
+///
+/// Registration is separated from waiting on purpose. tokio's signal registry
+/// discards an event that has no listener registered, so a watcher built
+/// *inside* the handler would leave a window in which a repeat signal — the
+/// operator's "stop waiting" — is dropped on the floor. [`ShutdownSignals`]
+/// registers once and can then be awaited any number of times, which is what
+/// makes "signal it twice" reliable.
+struct ShutdownSignals {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut term = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "failed to install SIGTERM handler — falling back to ctrl-c only"
-                );
-                let _ = tokio::signal::ctrl_c().await;
-                return "SIGINT";
-            }
-        };
-        let mut hup = match signal(SignalKind::hangup()) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to install SIGHUP handler");
-                return tokio::select! {
-                    _ = tokio::signal::ctrl_c() => "SIGINT",
-                    _ = term.recv() => "SIGTERM",
-                };
-            }
-        };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => "SIGINT",
-            _ = term.recv() => "SIGTERM",
-            _ = hup.recv() => "SIGHUP",
+    terminate: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    hangup: Option<tokio::signal::unix::Signal>,
+}
+
+impl ShutdownSignals {
+    /// Register the signal streams. Synchronous: the listeners exist from this
+    /// moment on, whatever the caller awaits next.
+    fn register() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            // A stream that cannot be registered is simply absent: ctrl-c and
+            // whatever else did register still work, and the failure is logged
+            // rather than fatal — a CP that cannot be stopped politely should
+            // still run.
+            let terminate = signal(SignalKind::terminate())
+                .inspect_err(|e| {
+                    warn!(error = %e, "failed to install SIGTERM handler");
+                })
+                .ok();
+            let hangup = signal(SignalKind::hangup())
+                .inspect_err(|e| {
+                    warn!(error = %e, "failed to install SIGHUP handler");
+                })
+                .ok();
+            Self { terminate, hangup }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {}
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-        "SIGINT"
+
+    /// Wait for the next shutdown signal and name it.
+    async fn recv(&mut self) -> &'static str {
+        #[cfg(unix)]
+        {
+            // `pending()` for an unregistered stream: it can never fire, and
+            // selecting on it keeps the arm shape uniform.
+            let never = || std::future::pending::<()>();
+            let term = async {
+                match self.terminate.as_mut() {
+                    Some(s) => {
+                        s.recv().await;
+                    }
+                    None => never().await,
+                }
+            };
+            let hup = async {
+                match self.hangup.as_mut() {
+                    Some(s) => {
+                        s.recv().await;
+                    }
+                    None => never().await,
+                }
+            };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => "SIGINT",
+                _ = term => "SIGTERM",
+                _ = hup => "SIGHUP",
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            "SIGINT"
+        }
     }
 }
 
@@ -93,83 +146,73 @@ async fn main() -> Result<()> {
     );
 
     let state = Arc::new(AppState::new(cfg));
-    let drain_budget = Duration::from_secs(state.cfg.shutdown_drain_secs);
-    // The process's exit is bounded by the drain budget plus slack for the
-    // listener's own bookkeeping. One knob, one bound: an orchestrator
-    // escalates to SIGKILL at the end of its grace period, so the CP's own
-    // deadline has to be the shorter one.
-    let hard_bound = drain_budget + Duration::from_secs(1);
     let sweeper = tokio::spawn(run_sweeper(state.clone()));
 
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .with_context(|| format!("binding {listen}"))?;
 
-    // The shutdown sequence is SPAWNED rather than awaited after the listener.
-    // Ordering it after `serve` was a real defect: axum's graceful shutdown
-    // ends when the last in-flight HTTP request finishes, and a peer that
-    // opened a socket and then said nothing (a half-sent request, a stalled
-    // upgrade) pins that wait for as long as the orchestrator allows the
-    // process to live — so the drain would never start, and the CP would be
-    // SIGKILLed with its delegations unresolved. Spawning it makes the drain
-    // begin the instant the signal lands, whatever hyper is doing.
+    // Registered once, before anything is awaited: see `ShutdownSignals`. The
+    // first wait consumes the signal that starts the drain; the second (in the
+    // task below) is the operator's "stop waiting".
+    let mut signals = ShutdownSignals::register();
     let (stop_accepting_tx, stop_accepting_rx) = tokio::sync::oneshot::channel::<()>();
-    let (drained_tx, drained_rx) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn({
+
+    // The listener runs as its own task. Awaiting `axum::serve` here and then
+    // draining would be the obvious shape and it is wrong: axum's graceful
+    // shutdown ends when the last in-flight HTTP request finishes, so a peer
+    // that opened a socket and then said nothing (a half-sent request, a stalled
+    // upgrade) would pin that wait — and with it the drain — for as long as the
+    // orchestrator lets the process live. Serving from a task lets the signal
+    // be handled here, immediately, whatever hyper is doing.
+    let mut serve_done = tokio::spawn({
         let state = Arc::clone(&state);
         async move {
-            let signal = shutdown_signal().await;
-            info!(signal, "shutdown signal received — draining connections");
-            // A second signal at ANY point before the process exits is the
-            // operator's "stop waiting": exit immediately with the signal's
-            // conventional status (128 + signum). Armed before the drain and
-            // deliberately left armed — the drain and the listener's wait are
-            // separate waits, and the escape hatch has to cover both. The task
-            // ends with the process if it never fires.
-            tokio::spawn(async {
-                let signal = shutdown_signal().await;
-                warn!(signal, "second shutdown signal — forcing immediate exit");
-                std::process::exit(signal_exit_code(signal));
-            });
-            // Nothing new may enter a CP that is leaving.
-            let _ = stop_accepting_tx.send(());
-            graceful_shutdown(&state).await;
-            let _ = drained_tx.send(());
+            axum::serve(listener, app(state))
+                .with_graceful_shutdown(async move {
+                    let _ = stop_accepting_rx.await;
+                })
+                .await
         }
     });
 
-    // The listener stops accepting as soon as the signal lands, and the wait
-    // for it is bounded by the same hard bound — hyper's bookkeeping must not
-    // be able to outlive the drain it is supposed to follow.
-    let serving =
-        axum::serve(listener, app(Arc::clone(&state))).with_graceful_shutdown(async move {
-            let _ = stop_accepting_rx.await;
-        });
-    let finished = tokio::time::timeout(hard_bound, async {
-        tokio::join!(
-            async {
-                // The drain is the shutdown: the synthesized terminals and the
-                // close frames get their chance to reach the wire here.
-                let _ = drained_rx.await;
-            },
-            async {
-                match tokio::time::timeout(hard_bound, serving).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => warn!(error = %e, "listener stopped with an error"),
-                    Err(_) => warn!(
-                        bound_secs = hard_bound.as_secs(),
-                        "the listener's graceful wait outlived the shutdown bound — dropping it"
-                    ),
-                }
-            },
-        );
-    })
-    .await;
-    if finished.is_err() {
-        warn!(
-            bound_secs = hard_bound.as_secs(),
-            "shutdown did not finish within its bound — exiting with the drain unfinished"
-        );
+    let signal = signals.recv().await;
+    info!(signal, "shutdown signal received — draining connections");
+
+    // A second signal at ANY point before the process exits is "stop waiting":
+    // exit immediately with the signal's conventional status (128 + signum).
+    // Armed from the SAME already-registered streams — the first `recv` above
+    // consumed its event, so this one waits for the next — which closes the
+    // window in which a repeat would be dropped by an unregistered listener.
+    // Deliberately left armed: the drain and the listener's wait are separate
+    // waits and the escape hatch must cover both. The task ends with the
+    // process if it never fires.
+    tokio::spawn(async move {
+        let signal = signals.recv().await;
+        warn!(signal, "second shutdown signal — forcing immediate exit");
+        std::process::exit(signal_exit_code(signal));
+    });
+
+    // Nothing new may enter a CP that is leaving. Then drain: bounded by
+    // `shutdown_drain_secs`, which resolves the in-flight delegations, lets
+    // every connection flush and close, and returns.
+    let _ = stop_accepting_tx.send(());
+    graceful_shutdown(&state).await;
+
+    // The drain is done; give the listener a bounded moment to finish its own
+    // bookkeeping, then stop regardless. The bound starts HERE, not at boot:
+    // a timer armed at startup would become the process's lifetime.
+    match tokio::time::timeout(LISTENER_SHUTDOWN_SLACK, &mut serve_done).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => warn!(error = %e, "listener stopped with an error"),
+        Ok(Err(join)) => warn!("listener task ended abnormally: {join:?}"),
+        Err(_) => {
+            warn!(
+                slack_secs = LISTENER_SHUTDOWN_SLACK.as_secs(),
+                "the listener's graceful wait outlived the shutdown slack — dropping it"
+            );
+            serve_done.abort();
+        }
     }
 
     // Only now: the sweeper exists to keep registrations and delegations

@@ -133,8 +133,10 @@ issue #1474).
   terminal (error `control plane shutting down`) and every serving runtime a
   `cp/cancel`, ahead of the 1012 close; a `cp/delegate` that reaches the CP
   mid-drain is refused `SATURATED` — back off and retry after reconnecting.
-  The process then exits 0. A second SIGTERM/SIGINT/SIGHUP before it is gone
-  is your "stop waiting": it exits immediately with 128 + signum (143 for
+  The process then exits 0 — including when the budget ran out with
+  connections still open, which is logged as a warning (a non-zero status
+  would read as a crash). A second SIGTERM/SIGINT/SIGHUP before it is gone is
+  your "stop waiting": it exits immediately with 128 + signum (143 for
   SIGTERM). A SIGKILL still leaves reconciliation to your deadlines. An
   initiator whose outbound queue was already full cannot receive its
   synthesized terminal — the CP logs that refusal; the delegation is then
