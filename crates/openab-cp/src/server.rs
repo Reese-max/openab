@@ -100,7 +100,7 @@ impl AppState {
     /// `shutdown_drain_secs` when it happens to leave its main loop — a
     /// connection that noticed the signal late must not be granted a longer
     /// life than the drain it is part of.
-    fn begin_shutdown(&self, reason: &'static str) {
+    pub fn begin_shutdown(&self, reason: &'static str) {
         let deadline = Instant::now() + Duration::from_secs(self.cfg.shutdown_drain_secs);
         *self.shutdown_deadline.lock() = Some(deadline);
         self.shutdown.send_replace(Some(reason));

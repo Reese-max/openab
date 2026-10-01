@@ -957,6 +957,28 @@ async fn a_second_signal_latching_mid_close_still_sends_a_close_frame() {
     );
 }
 
+#[tokio::test]
+async fn a_socket_upgraded_after_the_drain_latched_is_never_registered() {
+    // The drain's first act is to latch the process-wide reason; a socket that
+    // completes its upgrade after that must be closed with the reason instead
+    // of registering into a CP that is leaving. Deterministic here on purpose:
+    // racing a real process's drain would only prove that the process was
+    // usually already gone.
+    let (state, url) = spawn_cp(cfg("register_timeout_secs = 30")).await;
+    state.begin_shutdown(REASON_SHUTDOWN);
+
+    let mut ws = connect(&url)
+        .await
+        .expect("the upgrade itself still completes");
+    let closed = wait_closed(&mut ws, Duration::from_secs(5)).await;
+    assert_eq!(
+        closed,
+        Some(shutdown_close()),
+        "a socket arriving after the latch must get the shutdown close, never a \
+         registration: got {closed:?}"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn sigterm_and_sighup_run_the_drain_and_exit_cleanly() {

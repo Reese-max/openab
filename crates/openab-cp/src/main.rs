@@ -86,28 +86,45 @@ impl ShutdownSignals {
         }
     }
 
+    /// `pending()` for an unregistered stream: it can never fire, and
+    /// selecting on it keeps the arm shape uniform.
+    #[cfg(unix)]
+    async fn arm(signal: Option<&mut tokio::signal::unix::Signal>) {
+        match signal {
+            Some(s) => {
+                s.recv().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    }
+
     /// Wait for the next shutdown signal and name it.
     async fn recv(&mut self) -> &'static str {
         #[cfg(unix)]
         {
-            // `pending()` for an unregistered stream: it can never fire, and
-            // selecting on it keeps the arm shape uniform.
-            async fn arm(signal: Option<&mut tokio::signal::unix::Signal>) {
-                match signal {
+            // Exactly ONE listener per signal, always. On unix
+            // `tokio::signal::ctrl_c()` IS `signal(SignalKind::interrupt())`, so
+            // selecting on both a registered SIGINT stream and ctrl-c would
+            // hand the SAME ctrl-c to two listeners — and the force-quit task
+            // would read the first signal's notification as a second one and
+            // exit immediately, skipping the drain entirely. (Measured: one
+            // ctrl-c force-exited 8 times out of 10.) ctrl-c is therefore the
+            // arm only where the stream could not be registered, where it is
+            // also the only thing that can work.
+            let interrupt = async {
+                match self.interrupt.as_mut() {
                     Some(s) => {
                         s.recv().await;
                     }
-                    None => std::future::pending::<()>().await,
+                    None => {
+                        let _ = tokio::signal::ctrl_c().await;
+                    }
                 }
-            }
+            };
             tokio::select! {
-                // Kept as the fallback for a host where the SIGINT stream
-                // could not be registered; whichever arm fires first names the
-                // same signal.
-                _ = tokio::signal::ctrl_c() => "SIGINT",
-                _ = arm(self.interrupt.as_mut()) => "SIGINT",
-                _ = arm(self.terminate.as_mut()) => "SIGTERM",
-                _ = arm(self.hangup.as_mut()) => "SIGHUP",
+                _ = interrupt => "SIGINT",
+                _ = Self::arm(self.terminate.as_mut()) => "SIGTERM",
+                _ = Self::arm(self.hangup.as_mut()) => "SIGHUP",
             }
         }
         #[cfg(not(unix))]
