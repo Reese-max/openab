@@ -49,8 +49,38 @@ rationale. The essentials:
 
 ## Health
 
-`GET /health` answers `ok` (liveness only; deeper checks are tracked in
-issue #1474).
+`GET /health` answers `ok` while the background sweeper is alive, and
+`503 sweeper degraded` from the moment the sweeper dies until its replacement
+completes a sweep pass.
+
+The sweeper is what expires leases and fires delegation deadlines, so a dead
+one is not cosmetic: leases of disconnected agents would never expire and
+overdue delegations would never resolve, while everything else the CP answers
+stays green. It is therefore supervised rather than fire-and-forget:
+
+- a **panic**, an **unexpected return**, or a **stall** (no completed pass
+  within 30 s — the only signal available for a task wedged mid-pass, since a
+  wedged task never returns) all count as death;
+- each death is recorded before the restart, so `/health` is degraded for the
+  whole window in which sweeping is stopped, and the replacement's first pass
+  clears it — a replacement never comes up while the CP still claims to be
+  healthy;
+- restarts wait out a backoff — 500 ms for the first restart of an incident,
+  doubling to a 30 s ceiling. The budget resets only for a sweeper that lasted a
+  full stall window *and* kept completing passes through it, so a crash loop
+  costs a bounded number of attempts instead of a hot loop, while a sweeper
+  that failed once after hours of healthy service still recovers immediately.
+
+A `503` therefore means "this CP is serving but not sweeping". The supervisor
+usually recovers on its own, so the useful response is an alert, not a
+restart-on-every-probe.
+
+> **Behavior change.** `/health` used to answer `200 ok` unconditionally. If a
+> deployment wires it to a liveness probe, that probe will now see `503` while
+> the sweeper is being restarted — prefer it as a readiness signal, or alert on
+> it without restarting the pod, since the supervisor recovers on its own. No
+> probe in this repository targets the CP (the Helm/Docker probes are for
+> `openab-gateway`, a different server on a different port).
 
 ## Client behavior to expect
 

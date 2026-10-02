@@ -24,7 +24,7 @@
 //! consulting CP logs.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -37,7 +37,7 @@ use axum::Router as AxumRouter;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::config::{AgentIdentity, CpConfig};
 use crate::events::EventHub;
@@ -59,6 +59,8 @@ pub struct AppState {
     /// Live connections per identity (`namespace/name`), counted from the
     /// upgrade so pre-registration sockets are bounded too.
     conns: Mutex<BTreeMap<String, u32>>,
+    /// Liveness of the background sweeper, surfaced through `/health`.
+    sweeper: SweeperHealth,
 }
 
 impl AppState {
@@ -70,6 +72,7 @@ impl AppState {
             router: Router::new(),
             rpc_id: AtomicU64::new(1),
             conns: Mutex::new(BTreeMap::new()),
+            sweeper: SweeperHealth::default(),
         }
     }
 
@@ -99,6 +102,75 @@ impl AppState {
     pub fn conn_count(&self, logical_id: &str) -> u32 {
         self.conns.lock().get(logical_id).copied().unwrap_or(0)
     }
+
+    /// Record one *completed* sweep pass. This is the sweeper's only
+    /// self-report: the supervisor reads the counter to tell a working sweeper
+    /// from one that is wedged mid-pass (a task that never returns also never
+    /// records a pass).
+    pub fn record_sweeper_pass(&self) {
+        self.sweeper.record_pass();
+    }
+
+    /// Record that the sweeper is gone (panicked, returned, or stalled).
+    /// Called by [`supervise_sweeper_task`] before it waits out a backoff, so
+    /// the window in which sweeping is stopped is never reported as healthy.
+    pub fn record_sweeper_death(&self) {
+        self.sweeper.record_death();
+    }
+
+    /// Current sweeper liveness, as `/health` reports it.
+    pub fn sweeper_status(&self) -> SweeperStatus {
+        self.sweeper.status()
+    }
+}
+
+/// Liveness of the background sweeper, as `/health` reports it.
+///
+/// A CP whose sweeper is dead is still accepting registrations and delegations
+/// while lease expiry and deadline sweeping have stopped — leases never expire
+/// and overdue delegations never resolve — so this state has to be visible
+/// above the process rather than only in its logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SweeperStatus {
+    /// Sweep passes completed since start. Rises while the sweeper works.
+    pub passes: u64,
+    /// Deaths observed by the supervisor (panic, unexpected return, stall).
+    /// Monotonic for the life of the process.
+    pub deaths: u64,
+    /// `true` from a death until a pass completes afterwards — i.e. lease
+    /// expiry and deadline sweeping are known to be stopped right now.
+    pub degraded: bool,
+}
+
+/// Counters behind [`SweeperStatus`]. Lock-free: every writer is the sweeper
+/// task itself and every reader is a request handler or the supervisor.
+#[derive(Debug, Default)]
+struct SweeperHealth {
+    passes: AtomicU64,
+    deaths: AtomicU64,
+    degraded: AtomicBool,
+}
+
+impl SweeperHealth {
+    /// A completed pass both proves progress and clears the degraded state: the
+    /// CP is sweeping again, so the previous death is no longer live.
+    fn record_pass(&self) {
+        self.passes.fetch_add(1, Ordering::Relaxed);
+        self.degraded.store(false, Ordering::Release);
+    }
+
+    fn record_death(&self) {
+        self.deaths.fetch_add(1, Ordering::Relaxed);
+        self.degraded.store(true, Ordering::Release);
+    }
+
+    fn status(&self) -> SweeperStatus {
+        SweeperStatus {
+            passes: self.passes.load(Ordering::Relaxed),
+            deaths: self.deaths.load(Ordering::Relaxed),
+            degraded: self.degraded.load(Ordering::Acquire),
+        }
+    }
 }
 
 /// RAII connection slot. Dropping it frees the identity's quota; it is never
@@ -127,8 +199,16 @@ pub fn app(state: Arc<AppState>) -> AxumRouter {
         .with_state(state)
 }
 
-async fn health() -> &'static str {
-    "ok"
+/// Liveness endpoint. Reports `503` whenever the background sweeper is known to
+/// be stopped, because everything else the CP answers stays green while lease
+/// expiry and deadline sweeping are dead — an orchestrator that only sees a
+/// 200 would never restart a CP whose maintenance loop is gone.
+async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if state.sweeper_status().degraded {
+        (StatusCode::SERVICE_UNAVAILABLE, "sweeper degraded")
+    } else {
+        (StatusCode::OK, "ok")
+    }
 }
 
 /// Reason string on the close frame sent when `cp/register` never arrived.
@@ -986,6 +1066,11 @@ pub fn sweep_leases(state: &Arc<AppState>, lease: Duration) {
 }
 
 /// Background sweeps: lease expiry and delegation deadlines.
+///
+/// Records a pass after every completed tick. That counter is the sweeper's
+/// liveness evidence: [`supervise_sweeper_task`] restarts the task when it
+/// stops advancing, which is the only way to notice a sweeper wedged inside a
+/// pass (a task stuck there never returns, so its `JoinHandle` never resolves).
 pub async fn run_sweeper(state: Arc<AppState>) {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1005,7 +1090,203 @@ pub async fn run_sweeper(state: Arc<AppState>) {
         ) {
             let _ = inst.tx.try_send(frame);
         }
+
+        state.record_sweeper_pass();
     }
+}
+
+/// Supervision policy for the background sweeper.
+///
+/// A struct rather than constants so the supervision loop can be exercised on a
+/// compressed clock (`#[tokio::test(start_paused = true)]`) — production values
+/// are deliberately too slow to test against directly.
+#[derive(Debug, Clone, Copy)]
+pub struct SweeperSupervision {
+    /// How often the supervisor samples the pass counter while a sweeper runs.
+    pub poll_interval: Duration,
+    /// A window with no completed pass this long means the sweeper is dead
+    /// even though its task never returned. Generous next to the 1 s tick, so
+    /// an ordinary slow pass is never mistaken for a stall.
+    pub stall_timeout: Duration,
+    /// Base delay for restart backoff. The supervisor counts a death *before* it
+    /// computes that death's delay, so the first restart of a fresh incident
+    /// waits `2 * initial_backoff` (500 ms in production) and every further
+    /// consecutive death doubles it up to [`Self::max_backoff`].
+    pub initial_backoff: Duration,
+    /// Ceiling for the doubling backoff across repeated deaths.
+    pub max_backoff: Duration,
+}
+
+/// Production policy. The stall window is 30 missed passes, and a sweeper that
+/// dies in a loop is retried at most once every 30 s — enough to recover from a
+/// transient fault, never enough to spin.
+pub const SWEEPER_SUPERVISION: SweeperSupervision = SweeperSupervision {
+    poll_interval: Duration::from_secs(1),
+    stall_timeout: Duration::from_secs(30),
+    initial_backoff: Duration::from_millis(250),
+    max_backoff: Duration::from_secs(30),
+};
+
+impl SweeperSupervision {
+    /// Delay before the restart that follows `deaths` consecutive deaths.
+    /// Doubling, saturating, and clamped to `max_backoff` — a pathological death
+    /// count cannot overflow the shift or the multiply into a zero (i.e. hot)
+    /// delay.
+    pub fn backoff_after_consecutive_deaths(&self, deaths: u32) -> Duration {
+        let factor = 1u32 << deaths.min(31);
+        self.initial_backoff
+            .saturating_mul(factor)
+            .min(self.max_backoff)
+    }
+}
+
+/// Passes a sweeper must have completed within one stall window before its
+/// next death is treated as a fresh incident rather than part of a crash loop.
+const MIN_PASSES_FOR_RESET: u64 = 2;
+
+/// How a supervised sweeper's run ended.
+enum SweeperDeath {
+    /// The task ended: `Err` is a panic (or an abort), `Ok(())` an unexpected
+    /// return from an infinite loop.
+    Ended(Result<(), tokio::task::JoinError>),
+    /// No completed pass for `stall_timeout`; the task is aborted.
+    Stalled,
+}
+
+/// Run and supervise the real sweeper until `shutdown` fires. The CP binary's
+/// entry point for background work.
+pub async fn supervise_sweeper(state: Arc<AppState>, shutdown: watch::Receiver<bool>) {
+    let task_state = Arc::clone(&state);
+    supervise_sweeper_task(state, shutdown, SWEEPER_SUPERVISION, move || {
+        run_sweeper(Arc::clone(&task_state))
+    })
+    .await
+}
+
+/// Supervise a background task on the CP's [`AppState`], restarting it when it
+/// dies until `shutdown` is signalled (or its sender is dropped).
+///
+/// Three ways a sweeper can stop sweeping without the CP noticing, and all
+/// three are handled here:
+///
+/// - it **panics** (the `JoinHandle` resolves with a panic `JoinError`);
+/// - it **returns** (the loop is infinite, so any return is a bug — treated the
+///   same way, since the alternative is a silently abandoned maintenance task);
+/// - it **stalls** — no completed pass within [`SweeperSupervision::stall_timeout`],
+///   which is the only signal available for a task wedged inside a pass.
+///
+/// Each death is recorded on `state` *before* the backoff wait, so `/health`
+/// reports `degraded` for the whole window in which sweeping is stopped, and
+/// the replacement's first pass clears it. Restarts are rate-limited so a
+/// deterministic panic becomes a bounded retry loop rather than a hot one.
+pub async fn supervise_sweeper_task<F, Fut>(
+    state: Arc<AppState>,
+    mut shutdown: watch::Receiver<bool>,
+    policy: SweeperSupervision,
+    mut make_task: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut consecutive_deaths: u32 = 0;
+    loop {
+        if *shutdown.borrow_and_update() {
+            return;
+        }
+        let started = tokio::time::Instant::now();
+        let passes_at_start = state.sweeper_status().passes;
+        // Borrowed by the select below so the handle stays ours to abort on
+        // shutdown and on a detected stall.
+        let mut task = tokio::spawn(make_task());
+
+        let mut poll = tokio::time::interval(policy.poll_interval);
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The first tick is immediate; consume it so the watchdog only fires
+        // after a real `poll_interval` has elapsed.
+        poll.tick().await;
+        let mut last_passes = state.sweeper_status().passes;
+        let mut last_progress = tokio::time::Instant::now();
+
+        let death = loop {
+            tokio::select! {
+                joined = &mut task => break SweeperDeath::Ended(joined),
+                _ = shutdown_requested(&mut shutdown) => {
+                    task.abort();
+                    // Await the abort rather than dropping the handle: a dropped
+                    // handle detaches, so the supervisor would return with the
+                    // sweeper's cancellation not yet carried out.
+                    let _ = task.await;
+                    return;
+                }
+                _ = poll.tick() => {
+                    let passes = state.sweeper_status().passes;
+                    if passes != last_passes {
+                        last_passes = passes;
+                        last_progress = tokio::time::Instant::now();
+                    } else if last_progress.elapsed() >= policy.stall_timeout {
+                        task.abort();
+                        let _ = task.await;
+                        break SweeperDeath::Stalled;
+                    }
+                }
+            }
+        };
+
+        state.record_sweeper_death();
+        // A sweeper that survived a full stall window AND kept sweeping through
+        // it was not crash-looping, so its replacement starts with a fresh
+        // budget: the ceiling from an old incident must not delay the next one.
+        // Progress is part of the test on purpose — a sweeper that completes one
+        // pass and then wedges for the whole window is exactly the failure the
+        // backoff exists to slow down, so it must keep growing its delay.
+        let made_progress = state
+            .sweeper_status()
+            .passes
+            .saturating_sub(passes_at_start)
+            >= MIN_PASSES_FOR_RESET;
+        consecutive_deaths = if started.elapsed() >= policy.stall_timeout && made_progress {
+            0
+        } else {
+            consecutive_deaths.saturating_add(1)
+        };
+        let backoff = policy.backoff_after_consecutive_deaths(consecutive_deaths);
+        match &death {
+            SweeperDeath::Ended(Err(joined)) if joined.is_panic() => error!(
+                "sweeper panicked ({joined}) — restarting in {backoff_ms} ms",
+                backoff_ms = backoff.as_millis() as u64,
+            ),
+            SweeperDeath::Ended(outcome) => warn!(
+                "sweeper returned unexpectedly ({outcome:?}) — restarting in {backoff_ms} ms",
+                backoff_ms = backoff.as_millis() as u64,
+            ),
+            SweeperDeath::Stalled => warn!(
+                "sweeper completed no pass for {stall_timeout_secs}s — restarting in {backoff_ms} ms",
+                stall_timeout_secs = policy.stall_timeout.as_secs(),
+                backoff_ms = backoff.as_millis() as u64,
+            ),
+        }
+
+        // The wait is interruptible: shutdown must not have to wait out a
+        // backoff that has grown to the ceiling.
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {}
+            _ = shutdown_requested(&mut shutdown) => return,
+        }
+    }
+}
+
+/// Resolves once shutdown is requested. Both outcomes of the wait mean the
+/// same thing — the sender fired, or the sender is gone and nothing can ever
+/// signal again — which is also why a dropped sender cannot turn the
+/// supervisor into a spin loop (`changed()` resolves immediately and forever in
+/// that case, and the caller always leaves the loop).
+async fn shutdown_requested(rx: &mut watch::Receiver<bool>) {
+    if *rx.borrow_and_update() {
+        return;
+    }
+    // `Err` means the sender is gone: no signal can ever arrive again, so a
+    // dropped sender is shutdown too.
+    let _ = rx.changed().await;
 }
 
 #[cfg(test)]

@@ -525,6 +525,19 @@ recovery semantics:
   deregistration is keyed by handle and capacity is released only for in-flight
   entries actually removed, so the guard and the sweeper can both run over the
   same handle without double-releasing.
+- **The sweeper is supervised, and its liveness is observable.** Lease expiry
+  and deadline sweeping live in one background task. A silent death of that task
+  (panic, unexpected return, or a stall inside a pass) is the same class of bug
+  as an unreaped connection task: a maintenance function quietly becomes
+  unbounded state growth — leases never expire, deadlines never fire — while
+  every other CP surface keeps answering normally. So the task is supervised
+  (restart with a doubling backoff that resets only after a run which both
+  lasted a full stall window and kept sweeping through it) and its liveness is
+  exposed: the sweeper records a pass per tick,
+  the supervisor records deaths, and `/health` answers `503 sweeper degraded`
+  from a death until the replacement's first pass. A CP that cannot prove it is
+  still sweeping must not claim to be healthy, because nothing else it answers
+  depends on the sweeper surviving.
 - **Capacity release follows entry removal.** Whichever path removes an
   in-flight entry (result commit, cancel, deadline sweep, instance failure,
   or a failed forward's rollback) releases its capacity reservation — and

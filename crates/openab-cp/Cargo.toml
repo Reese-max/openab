@@ -24,3 +24,8 @@ subtle = "2"
 # WebSocket client for the end-to-end admission/lifecycle tests. Same version
 # axum 0.8 already uses, so it adds no new dependency to the workspace.
 tokio-tungstenite = "0.29"
+# `test-util` (feature-unified onto the tokio above, so no new crate enters the
+# lockfile) for `#[tokio::test(start_paused = true)]`: the sweeper-supervision
+# tests drive multi-second backoff and stall windows on a simulated clock
+# instead of sleeping through them.
+tokio = { version = "1", features = ["test-util"] }
