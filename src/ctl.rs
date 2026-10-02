@@ -58,6 +58,10 @@ pub struct Response {
 
 /// Handler trait — `openab run` provides the concrete implementation that
 /// can access Discord/Slack adapters.
+// `#[async_trait]` stamps a bare `#[must_use]` on every method it expands to,
+// which `clippy::double_must_use` flags even though the attribute is generated
+// and cannot carry a message.
+#[allow(clippy::double_must_use)]
 #[cfg(unix)]
 #[async_trait::async_trait]
 pub trait CtlHandler: Send + Sync + 'static {
@@ -68,9 +72,7 @@ pub trait CtlHandler: Send + Sync + 'static {
 /// Start the control socket server. Call this from `openab run` startup.
 /// Returns a JoinHandle; abort it on shutdown.
 #[cfg(unix)]
-pub fn spawn_server(
-    handler: std::sync::Arc<dyn CtlHandler>,
-) -> tokio::task::JoinHandle<()> {
+pub fn spawn_server(handler: std::sync::Arc<dyn CtlHandler>) -> tokio::task::JoinHandle<()> {
     spawn_server_at(socket_path(), handler)
 }
 
@@ -116,10 +118,7 @@ pub fn spawn_server_at(
 }
 
 #[cfg(unix)]
-async fn handle_conn(
-    stream: UnixStream,
-    handler: &dyn CtlHandler,
-) -> anyhow::Result<()> {
+async fn handle_conn(stream: UnixStream, handler: &dyn CtlHandler) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
     if let Some(line) = lines.next_line().await? {
@@ -127,7 +126,9 @@ async fn handle_conn(
         let resp = match req.action {
             Action::Set => {
                 let val = req.value.as_deref().unwrap_or("");
-                handler.handle_set(req.thread_id.as_deref(), &req.key, val).await
+                handler
+                    .handle_set(req.thread_id.as_deref(), &req.key, val)
+                    .await
             }
             Action::Get => handler.handle_get(req.thread_id.as_deref(), &req.key).await,
         };
@@ -155,7 +156,10 @@ pub fn new_registry() -> ThreadRegistry {
 #[cfg(unix)]
 #[allow(dead_code)]
 pub async fn register_thread(registry: &ThreadRegistry, thread_id: &str, platform: &str) {
-    registry.write().await.insert(thread_id.to_string(), platform.to_string());
+    registry
+        .write()
+        .await
+        .insert(thread_id.to_string(), platform.to_string());
 }
 
 /// Type-alias for the Discord shard slot. When the discord feature is disabled,
@@ -182,7 +186,11 @@ impl RuntimeHandler {
         registry: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
         shard: ShardSlot,
     ) -> Self {
-        Self { adapters, registry, shard }
+        Self {
+            adapters,
+            registry,
+            shard,
+        }
     }
 
     /// Resolve which adapter to use for a given thread_id.
@@ -234,7 +242,8 @@ impl CtlHandler for RuntimeHandler {
                 let Some((adapter, tid)) = self.resolve(thread_id).await else {
                     return Response {
                         ok: false,
-                        message: "unknown thread (use --thread or register via message dispatch)".into(),
+                        message: "unknown thread (use --thread or register via message dispatch)"
+                            .into(),
                         value: None,
                     };
                 };
@@ -262,7 +271,8 @@ impl CtlHandler for RuntimeHandler {
                 let Some((_adapter, tid)) = self.resolve(thread_id).await else {
                     return Response {
                         ok: false,
-                        message: "unknown thread (use --thread or register via message dispatch)".into(),
+                        message: "unknown thread (use --thread or register via message dispatch)"
+                            .into(),
                         value: None,
                     };
                 };
@@ -477,7 +487,12 @@ mod tests {
         struct MockHandler;
         #[async_trait::async_trait]
         impl CtlHandler for MockHandler {
-            async fn handle_set(&self, thread_id: Option<&str>, key: &str, value: &str) -> Response {
+            async fn handle_set(
+                &self,
+                thread_id: Option<&str>,
+                key: &str,
+                value: &str,
+            ) -> Response {
                 Response {
                     ok: true,
                     message: format!("{key} = {value} (thread: {})", thread_id.unwrap_or("none")),
@@ -503,24 +518,30 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Test set
-        let resp = send_request_to(&sock, &Request {
-            action: Action::Set,
-            key: "thread.name".into(),
-            value: Some("hello world".into()),
-            thread_id: Some("999".into()),
-        })
+        let resp = send_request_to(
+            &sock,
+            &Request {
+                action: Action::Set,
+                key: "thread.name".into(),
+                value: Some("hello world".into()),
+                thread_id: Some("999".into()),
+            },
+        )
         .await
         .unwrap();
         assert!(resp.ok);
         assert_eq!(resp.message, "thread.name = hello world (thread: 999)");
 
         // Test get
-        let resp = send_request_to(&sock, &Request {
-            action: Action::Get,
-            key: "thread.name".into(),
-            value: None,
-            thread_id: None,
-        })
+        let resp = send_request_to(
+            &sock,
+            &Request {
+                action: Action::Get,
+                key: "thread.name".into(),
+                value: None,
+                thread_id: None,
+            },
+        )
         .await
         .unwrap();
         assert!(resp.ok);
